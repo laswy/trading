@@ -81,6 +81,16 @@ BASE_MAX_PROFILE_ADDRS  = int(  os.getenv("BASE_MAX_PROFILE_ADDRS",    "40"))  #
 SOL_PREFILTER_MIN_SCORE = int(  os.getenv("SOL_PREFILTER_MIN_SCORE",   "25"))
 SCORE_GREEN           = int(  os.getenv("SCORE_GREEN_MIN",        "70"))
 SCORE_YELLOW          = int(  os.getenv("SCORE_YELLOW_MIN",       "40"))
+STRICT_SOLANA_ONLY    = os.getenv("STRICT_SOLANA_ONLY", "1") == "1"
+REQUIRE_KNOWN_LP      = os.getenv("REQUIRE_KNOWN_LP", "1") == "1"
+GOPLUS_MAX_RETRIES    = int(os.getenv("GOPLUS_MAX_RETRIES", "2"))
+GOPLUS_FAIL_OPEN      = os.getenv("GOPLUS_FAIL_OPEN", "0") == "1"
+PUMP_1H_PENALTY_PCT   = float(os.getenv("PUMP_1H_PENALTY_PCT", "120"))
+PUMP_1H_HARD_CAP_PCT  = float(os.getenv("PUMP_1H_HARD_CAP_PCT", "250"))
+RISK_LOOKBACK_MIN     = int(os.getenv("RISK_LOOKBACK_MIN", "180"))
+RISK_RUG_LIMIT        = int(os.getenv("RISK_RUG_LIMIT", "3"))
+RISK_MIN_SCORE_BUMP   = int(os.getenv("RISK_MIN_SCORE_BUMP", "5"))
+MIN_EDGE_SCORE        = int(os.getenv("MIN_EDGE_SCORE", "60"))
 
 BUY_TXN_BY_AGE = [
     (10,   int(os.getenv("BUY_TXN_AGE_10MIN",  "2"))),
@@ -100,7 +110,7 @@ BASE_USDC           = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_RPC_URL        = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
 BASE_WALLET_PRIVKEY = os.getenv("BASE_PRIVATE_KEY", "")   # hex, 0x-prefixed optional
 BASE_VALID_QUOTES   = {"ETH", "WETH", "USDC", "USDT"}
-SUPPORTED_CHAINS    = {"solana", "base"}
+SUPPORTED_CHAINS    = {"solana"} if STRICT_SOLANA_ONLY else {"solana", "base"}
 
 # ── Rug detection ─────────────────────────────────────────────────
 RUG_PRICE_DROP_1H   = float(os.getenv("RUG_PRICE_DROP_1H", "-60"))   # % ngưỡng rug
@@ -875,33 +885,37 @@ def get_token_decimals(mint: str, chain: str = "solana") -> int:
 def check_goplus(addr: str, age_min: Optional[float] = None,
                   chain: str = "solana") -> Tuple[bool, str]:
     """GoPlus security check. chain=base dùng EVM endpoint."""
-    try:
-        if chain == "base":
-            # FIX: EVM địa chỉ phải lowercase khi query GoPlus
-            addr_q = addr.lower()
-            url = f"https://api.gopluslabs.io/api/v1/token_security/8453?contract_addresses={addr_q}"
-        else:
-            addr_q = addr
-            url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={addr_q}"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        result = r.json().get("result", {})
-        # FIX: lookup cả lowercase lẫn original để không miss kết quả
-        res = result.get(addr_q) or result.get(addr) or {}
-        if not res:
+    for attempt in range(1, GOPLUS_MAX_RETRIES + 1):
+        try:
+            if chain == "base":
+                addr_q = addr.lower()
+                url = f"https://api.gopluslabs.io/api/v1/token_security/8453?contract_addresses={addr_q}"
+            else:
+                addr_q = addr
+                url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={addr_q}"
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            result = r.json().get("result", {})
+            res = result.get(addr_q) or result.get(addr) or {}
+            if not res:
+                return False, "GoPlus empty result"
+            bad = [lbl for k, lbl in GOPLUS_CRITICAL.items() if str(res.get(k,"0")) == "1"]
+            if bad:
+                return False, ", ".join(bad)
+            relax = (age_min is not None and age_min < GOPLUS_RELAX_UNDER)
+            if not relax:
+                noncrit = [lbl for k, lbl in GOPLUS_NONCRIT.items() if str(res.get(k,"0")) == "1"]
+                if noncrit:
+                    return False, ", ".join(noncrit)
             return True, ""
-        bad = [lbl for k, lbl in GOPLUS_CRITICAL.items() if str(res.get(k,"0")) == "1"]
-        if bad:
-            return False, ", ".join(bad)
-        relax = (age_min is not None and age_min < GOPLUS_RELAX_UNDER)
-        if not relax:
-            noncrit = [lbl for k, lbl in GOPLUS_NONCRIT.items() if str(res.get(k,"0")) == "1"]
-            if noncrit:
-                return False, ", ".join(noncrit)
-        return True, ""
-    except Exception as e:
-        print(f"[GoPlus] ⚠️ {addr[:12]}: {e} — cho qua")
-        return True, ""
+        except Exception as e:
+            print(f"[GoPlus] ⚠️ {addr[:12]}: {e} (attempt {attempt}/{GOPLUS_MAX_RETRIES})")
+            if attempt < GOPLUS_MAX_RETRIES:
+                time.sleep(0.5)
+                continue
+            if GOPLUS_FAIL_OPEN:
+                return True, "GoPlus unavailable (fail-open)"
+            return False, "GoPlus unavailable"
 
 def check_lp_status(addr: str) -> str:
     try:
@@ -982,7 +996,43 @@ def calculate_score(t: dict) -> Tuple[int, list]:
         except Exception:
             pass
 
+    # Phạt pump quá nóng để giảm fomo đỉnh
+    p1h = float(t.get("price_change_1h", 0) or 0)
+    if p1h >= PUMP_1H_HARD_CAP_PCT:
+        score -= 35
+        detail.append(f"🥵 Pump 1h quá cao ({p1h:+.1f}%): -35")
+    elif p1h >= PUMP_1H_PENALTY_PCT:
+        score -= 15
+        detail.append(f"⚠️ Pump 1h cao ({p1h:+.1f}%): -15")
+
     return max(0, min(score, 100)), detail
+
+def _market_risk_bump() -> int:
+    """Nếu rug gần đây tăng cao, tự tăng ngưỡng vào lệnh."""
+    since = int(time.time()) - (RISK_LOOKBACK_MIN * 60)
+    try:
+        with _db_lock:
+            conn = _get_conn()
+            row = conn.execute(
+                "SELECT COUNT(1) AS c FROM permanent_ban WHERE reason LIKE 'rug_detected%' AND added_time>=?",
+                (since,)
+            ).fetchone()
+            conn.close()
+        rugs = int(row["c"] or 0) if row else 0
+        return RISK_MIN_SCORE_BUMP if rugs >= RISK_RUG_LIMIT else 0
+    except Exception:
+        return 0
+
+def _risk_penalty(t: dict) -> int:
+    p = 0
+    if t.get("lp_status") == "unknown":
+        p += 12
+    p1h = float(t.get("price_change_1h", 0) or 0)
+    if p1h >= PUMP_1H_HARD_CAP_PCT:
+        p += 20
+    elif p1h >= PUMP_1H_PENALTY_PCT:
+        p += 8
+    return p
 
 def _score_bar(score: int) -> Tuple[str, str, str]:
     if score >= SCORE_GREEN:
@@ -1002,7 +1052,6 @@ PROFILE_SOURCES = [
 ]
 NEW_PAIRS_URLS = [
     "https://api.dexscreener.com/latest/dex/pairs/solana/new",
-    "https://api.dexscreener.com/latest/dex/pairs/base/new",
 ]
 
 def _extract_social(pair: dict, kind: str) -> str:
@@ -1144,7 +1193,9 @@ def fetch_profile_addresses() -> List[str]:
             _dex_cache.set(url, batch)
         except Exception as e:
             print(f"[Scan-A] ⚠️  {url.split('/')[-1]}: {e}")
-    # Giới hạn quota riêng cho mỗi chain
+    # Solana-only mode: chỉ lấy Solana
+    if STRICT_SOLANA_ONLY:
+        return sol_addrs[:SOL_MAX_PROFILE_ADDRS]
     return sol_addrs[:SOL_MAX_PROFILE_ADDRS] + base_addrs[:BASE_MAX_PROFILE_ADDRS]
 
 def fetch_token_pairs(addr: str) -> List[dict]:
@@ -1417,17 +1468,26 @@ def _validate_one(token: dict) -> Optional[dict]:
 
     # LP status (solana only — Base skip)
     token["lp_status"] = check_lp_status(addr) if chain == "solana" else "unknown"
+    if REQUIRE_KNOWN_LP and token["lp_status"] == "unknown":
+        print(f"[Validator] 🚫 {token['symbol']}: LP unknown")
+        return None
 
     # Final score
     score, detail = calculate_score(token)
+    risk_penalty = _risk_penalty(token)
+    edge_score = max(0, score - risk_penalty)
+    min_score_dynamic = MIN_SCORE + _market_risk_bump()
     token["_opp_score"] = score
+    token["_edge_score"] = edge_score
     token["_score_detail"] = detail
 
     age_log = f"{age_min:.0f}p" if age_min is not None else "N/A"
-    print(f"[Validator] {'✅' if score >= MIN_SCORE else '⏭ '} {token['symbol']:<10} "
-          f"| Score: {score}/100 | Tuổi: {age_log} | Liq: {_fmt_usd(token['liquidity_usd'])}")
+    passed = (score >= min_score_dynamic and edge_score >= MIN_EDGE_SCORE)
+    print(f"[Validator] {'✅' if passed else '⏭ '} {token['symbol']:<10} "
+          f"| Score: {score}/100 | Edge: {edge_score}/100 | Min: {min_score_dynamic} "
+          f"| Tuổi: {age_log} | Liq: {_fmt_usd(token['liquidity_usd'])}")
 
-    if score >= MIN_SCORE:
+    if passed:
         return token
     return None
 
@@ -1747,9 +1807,10 @@ def main():
         "SOLANA_PRIVATE_KEY": WALLET_PRIVKEY,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-        # FIX: kiểm tra BASE_PRIVATE_KEY để fail-fast nếu chưa set
-        "BASE_PRIVATE_KEY": BASE_WALLET_PRIVKEY,
     }.items() if not v]
+    if not STRICT_SOLANA_ONLY:
+        if not BASE_WALLET_PRIVKEY:
+            missing.append("BASE_PRIVATE_KEY")
     if missing:
         print(f"⚠️  Thiếu .env: {', '.join(missing)}")
         return
@@ -1763,11 +1824,13 @@ def main():
     print(f"  Wallet     : {WALLET_ADDRESS[:12]}...{WALLET_ADDRESS[-6:]}")
     print(f"  Buy amount : {BUY_AMOUNT_USDC} USDC / lần")
     print(f"  Min Score  : {MIN_SCORE}/100")
+    print(f"  Min Edge   : {MIN_EDGE_SCORE}/100")
     print(f"  Take Profit: +{TAKE_PROFIT_PCT:.0f}%")
     print(f"  Slippage   : {SLIPPAGE_PCT}%")
     print(f"  Scan every : {SCAN_INTERVAL}s")
     print(f"  TP check   : mỗi {TP_CHECK_INTERVAL}s")
     print(f"  Validators : {VALIDATOR_WORKERS} threads song song")
+    print(f"  Mode       : {'Solana only' if STRICT_SOLANA_ONLY else 'Multi-chain'}")
     print(f"  DB         : {DB_PATH} (SQLite)")
     print(f"  Signal →   : {', '.join(TELEGRAM_SIGNAL_CHANNELS)}")
     print(f"  Positions  : {len(db_get_positions())} đang mở")
