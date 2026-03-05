@@ -731,8 +731,7 @@ def execute_swap_base(from_token: str, to_token: str, amount_raw: str,
         signed = w3.eth.account.sign_transaction(tx, privkey)
         raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
         if raw_tx is None:
-            print("[Base] ❌ Không lấy được raw signed transaction")
-            return None
+            raise RuntimeError("Không lấy được signed raw transaction từ web3 account")
         tx_hash = w3.eth.send_raw_transaction(raw_tx).hex()
         print(f"[Base] ✅ {label}: {tx_hash[:20]}...")
         return tx_hash
@@ -774,6 +773,20 @@ def get_token_raw_balance_base(token_addr: str) -> str:
     except Exception as e:
         print(f"[Base] ❌ get_balance: {e}")
         return "0"
+
+def get_token_decimals_base(token_addr: str) -> int:
+    """Đọc decimals ERC-20 trên Base. Fallback 18 nếu lỗi."""
+    try:
+        from web3 import Web3
+        w3 = _get_base_w3()
+        abi = [{"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],
+                "stateMutability":"view","type":"function"}]
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(token_addr), abi=abi)
+        return int(contract.functions.decimals().call())
+    except Exception as e:
+        print(f"[Base] ⚠️  get_decimals: {e} — fallback 18")
+        return 18
 
 # ================================================================
 # SWAP (chain-agnostic dispatcher)
@@ -849,6 +862,11 @@ def get_token_decimals_rpc(mint: str) -> int:
         return int(info.get("data",{}).get("parsed",{}).get("info",{}).get("decimals", 6))
     except:
         return 6
+
+def get_token_decimals(mint: str, chain: str = "solana") -> int:
+    if chain == "base":
+        return get_token_decimals_base(mint)
+    return get_token_decimals_rpc(mint)
 
 # ================================================================
 # GOPLUS SECURITY
@@ -1251,17 +1269,21 @@ def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
 def send_tp_signal(pos: dict, cur_price: float, pct: float, sell_sig: str):
     profit = pos["usdc_spent"] * pct / 100
     emoji  = "🤑🚀" if pct >= 100 else ("💰🔥" if pct >= 50 else "✅📈")
+    chain = pos.get("chain", "solana")
+    chain_name = "Base" if chain == "base" else "Solana"
+    tx_url = "https://basescan.org/tx/" if chain == "base" else "https://solscan.io/tx/"
+    chart_url = f"https://dexscreener.com/{chain}/{pos.get('pair_address','')}"
     msg = (
-        f"{emoji} <b>TAKE PROFIT! Solana</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>TAKE PROFIT! {chain_name}</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>${pos['symbol']}</b>  (<code>{pos['mint']}</code>)\n\n"
         f"  Giá vào:   ${pos['entry_price']:.10f}\n"
         f"  Giá bán:   ${cur_price:.10f}\n"
         f"  Lợi nhuận: <b>+{pct:.2f}%</b>  ({_fmt_usd(profit)})\n"
         f"  Đầu tư:    {pos['usdc_spent']:.2f} USDC\n"
         f"  Giữ:       {_duration_str(pos['entry_time'])}\n\n"
-        f"<a href='https://solscan.io/tx/{sell_sig}'>✅ TX bán</a> | "
-        f"<a href='https://dexscreener.com/solana/{pos.get('pair_address','')}'>📉 Chart</a>\n"
-        f"#TakeProfit #Solana #{pos['symbol']}"
+        f"<a href='{tx_url}{sell_sig}'>✅ TX bán</a> | "
+        f"<a href='{chart_url}'>📉 Chart</a>\n"
+        f"#TakeProfit #{chain_name} #{pos['symbol']}"
     )
     _send_tg(msg)
 
@@ -1472,6 +1494,12 @@ def _execute_buy(token: dict):
     db_save_position(token, sig, BUY_AMOUNT_USDC)
     db_add_blacklist(addr)
     print(f"[Buyer] ✅ {sym} | sig: {sig[:20]}... → xác nhận balance...")
+
+    # ── Lấy balance trước swap để tính delta chính xác ──────────────
+    # Phải lấy TRƯỚC khi gửi TX để tính delta = token nhận được thực tế
+    decimals      = get_token_decimals(addr, chain=chain)
+    bal_before_raw = get_token_raw_balance(addr, chain=chain)
+    bal_before     = int(bal_before_raw) if bal_before_raw.isdigit() else 0
 
     # Background: poll TX confirm → đọc balance sau → tính actual_price
     def _confirm_entry():
