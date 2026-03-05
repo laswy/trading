@@ -619,20 +619,28 @@ def _get_usdc_spent_base(sig: str) -> float:
         # ERC-20 Transfer topic: keccak256("Transfer(address,address,uint256)")
         TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-        for log in rcpt.get("logs", []):
-            if log.get("address", "").lower() != usdc:
+        logs = rcpt["logs"] if "logs" in rcpt else []
+        for log in logs:
+            log_addr = str(log.get("address", "") if hasattr(log, "get") else log["address"]).lower()
+            if log_addr != usdc:
                 continue
-            topics = log.get("topics", [])
-            if not topics or topics[0].lower() != TRANSFER_TOPIC:
+            topics = log.get("topics", []) if hasattr(log, "get") else log["topics"]
+            t0_hex = topics[0].hex() if topics else ""
+            if not topics or t0_hex.lower() != TRANSFER_TOPIC:
                 continue
             if len(topics) < 3:
                 continue
             # topics[1] = from address (padded 32 bytes)
-            from_addr = "0x" + topics[1][-40:]
+            from_addr = "0x" + topics[1].hex()[-40:]
             if from_addr.lower() != wallet:
                 continue
             # data = amount (uint256, hex)
-            amount_raw = int(log.get("data", "0x0"), 16)
+            data_hex = log.get("data", "0x0") if hasattr(log, "get") else log["data"]
+            if hasattr(data_hex, "hex"):
+                data_hex = data_hex.hex()
+            if not str(data_hex).startswith("0x"):
+                data_hex = "0x" + str(data_hex)
+            amount_raw = int(data_hex, 16)
             return amount_raw / (10 ** 6)  # USDC = 6 decimals
         return 0.0
     except Exception as e:
@@ -677,6 +685,9 @@ def execute_swap_base(from_token: str, to_token: str, amount_raw: str,
         w3 = _get_base_w3()
 
         tx_obj = data["data"][0].get("tx", {})
+        if not tx_obj:
+            print("[Base] ❌ OKX không trả về tx object")
+            return None
         privkey = BASE_WALLET_PRIVKEY if BASE_WALLET_PRIVKEY.startswith("0x") \
                   else "0x" + BASE_WALLET_PRIVKEY
         acct    = w3.eth.account.from_key(privkey)
@@ -718,7 +729,11 @@ def execute_swap_base(from_token: str, to_token: str, amount_raw: str,
               f"{'EIP-1559' if max_fee else 'legacy'}")
 
         signed = w3.eth.account.sign_transaction(tx, privkey)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction).hex()
+        raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+        if raw_tx is None:
+            print("[Base] ❌ Không lấy được raw signed transaction")
+            return None
+        tx_hash = w3.eth.send_raw_transaction(raw_tx).hex()
         print(f"[Base] ✅ {label}: {tx_hash[:20]}...")
         return tx_hash
 
@@ -1438,6 +1453,12 @@ def _execute_buy(token: dict):
     chain     = token.get("chain", "solana")
     usdc_addr = BASE_USDC if chain == "base" else SOL_USDC
 
+    # ── Lấy balance trước swap để tính delta chính xác ──────────────
+    # Phải lấy TRƯỚC khi gửi TX để tính delta = token nhận được thực tế
+    decimals      = get_token_decimals_rpc(addr) if chain == "solana" else 18
+    bal_before_raw = get_token_raw_balance(addr, chain=chain)
+    bal_before     = int(bal_before_raw) if bal_before_raw.isdigit() else 0
+
     print(f"[Buyer] 🟢 {sym} [{chain.upper()}] | Score: {score}/100 → MUA {BUY_AMOUNT_USDC} USDC")
     sig = execute_swap(usdc_addr, addr, _usdc_raw(BUY_AMOUNT_USDC),
                        label=f"BUY {sym}", chain=chain)
@@ -1451,12 +1472,6 @@ def _execute_buy(token: dict):
     db_save_position(token, sig, BUY_AMOUNT_USDC)
     db_add_blacklist(addr)
     print(f"[Buyer] ✅ {sym} | sig: {sig[:20]}... → xác nhận balance...")
-
-    # ── Lấy balance trước swap để tính delta chính xác ──────────────
-    # Phải lấy TRƯỚC khi gửi TX để tính delta = token nhận được thực tế
-    decimals      = get_token_decimals_rpc(addr) if chain == "solana" else 18
-    bal_before_raw = get_token_raw_balance(addr, chain=chain)
-    bal_before     = int(bal_before_raw) if bal_before_raw.isdigit() else 0
 
     # Background: poll TX confirm → đọc balance sau → tính actual_price
     def _confirm_entry():
