@@ -1286,7 +1286,6 @@ def send_tp_signal(pos: dict, cur_price: float, pct: float, sell_sig: str):
         f"#TakeProfit #{chain_name} #{pos['symbol']}"
     )
     _send_tg(msg)
-
 # ================================================================
 # THREAD 1 — SCANNER (4 nguồn, song song)
 # ================================================================
