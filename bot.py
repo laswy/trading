@@ -619,20 +619,26 @@ def _get_usdc_spent_base(sig: str) -> float:
         # ERC-20 Transfer topic: keccak256("Transfer(address,address,uint256)")
         TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-        for log in rcpt.get("logs", []):
-            if log.get("address", "").lower() != usdc:
+        for log in rcpt["logs"]:
+            log_addr = str(log["address"]).lower()
+            if log_addr != usdc:
                 continue
-            topics = log.get("topics", [])
-            if not topics or topics[0].lower() != TRANSFER_TOPIC:
+            topics = log["topics"]
+            if not topics:
+                continue
+            topic0 = topics[0].hex() if hasattr(topics[0], "hex") else str(topics[0])
+            if topic0.lower() != TRANSFER_TOPIC:
                 continue
             if len(topics) < 3:
                 continue
             # topics[1] = from address (padded 32 bytes)
-            from_addr = "0x" + topics[1][-40:]
+            topic1 = topics[1].hex() if hasattr(topics[1], "hex") else str(topics[1])
+            from_addr = "0x" + topic1[-40:]
             if from_addr.lower() != wallet:
                 continue
             # data = amount (uint256, hex)
-            amount_raw = int(log.get("data", "0x0"), 16)
+            data_hex = log["data"].hex() if hasattr(log["data"], "hex") else str(log["data"])
+            amount_raw = int(data_hex, 16)
             return amount_raw / (10 ** 6)  # USDC = 6 decimals
         return 0.0
     except Exception as e:
@@ -718,7 +724,8 @@ def execute_swap_base(from_token: str, to_token: str, amount_raw: str,
               f"{'EIP-1559' if max_fee else 'legacy'}")
 
         signed = w3.eth.account.sign_transaction(tx, privkey)
-        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction).hex()
+        raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+        tx_hash = w3.eth.send_raw_transaction(raw_tx).hex()
         print(f"[Base] ✅ {label}: {tx_hash[:20]}...")
         return tx_hash
 
@@ -759,6 +766,19 @@ def get_token_raw_balance_base(token_addr: str) -> str:
     except Exception as e:
         print(f"[Base] ❌ get_balance: {e}")
         return "0"
+
+def get_token_decimals_base(token_addr: str) -> int:
+    """Đọc ERC-20 decimals() trên Base."""
+    try:
+        from web3 import Web3
+        w3 = _get_base_w3()
+        abi = [{"inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}],
+                "stateMutability": "view", "type": "function"}]
+        contract = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=abi)
+        return int(contract.functions.decimals().call())
+    except Exception as e:
+        print(f"[Base] ⚠️  decimals() lỗi cho {token_addr[:10]}...: {e} (fallback=18)")
+        return 18
 
 # ================================================================
 # SWAP (chain-agnostic dispatcher)
@@ -834,6 +854,11 @@ def get_token_decimals_rpc(mint: str) -> int:
         return int(info.get("data",{}).get("parsed",{}).get("info",{}).get("decimals", 6))
     except:
         return 6
+
+def get_token_decimals(mint: str, chain: str = "solana") -> int:
+    if chain == "base":
+        return get_token_decimals_base(mint)
+    return get_token_decimals_rpc(mint)
 
 # ================================================================
 # GOPLUS SECURITY
@@ -1236,20 +1261,24 @@ def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
 def send_tp_signal(pos: dict, cur_price: float, pct: float, sell_sig: str):
     profit = pos["usdc_spent"] * pct / 100
     emoji  = "🤑🚀" if pct >= 100 else ("💰🔥" if pct >= 50 else "✅📈")
+    chain = pos.get("chain", "solana")
+    chain_name = "Base" if chain == "base" else "Solana"
+    chain_scan = "https://basescan.org/tx/" if chain == "base" else "https://solscan.io/tx/"
+    chain_chart = f"https://dexscreener.com/{chain}/{pos.get('pair_address','')}"
+
     msg = (
-        f"{emoji} <b>TAKE PROFIT! Solana</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>TAKE PROFIT! {chain_name}</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>${pos['symbol']}</b>  (<code>{pos['mint']}</code>)\n\n"
         f"  Giá vào:   ${pos['entry_price']:.10f}\n"
         f"  Giá bán:   ${cur_price:.10f}\n"
         f"  Lợi nhuận: <b>+{pct:.2f}%</b>  ({_fmt_usd(profit)})\n"
         f"  Đầu tư:    {pos['usdc_spent']:.2f} USDC\n"
         f"  Giữ:       {_duration_str(pos['entry_time'])}\n\n"
-        f"<a href='https://solscan.io/tx/{sell_sig}'>✅ TX bán</a> | "
-        f"<a href='https://dexscreener.com/solana/{pos.get('pair_address','')}'>📉 Chart</a>\n"
-        f"#TakeProfit #Solana #{pos['symbol']}"
+        f"<a href='{chain_scan}{sell_sig}'>✅ TX bán</a> | "
+        f"<a href='{chain_chart}'>📉 Chart</a>\n"
+        f"#TakeProfit #{chain_name} #{pos['symbol']}"
     )
     _send_tg(msg)
-
 # ================================================================
 # THREAD 1 — SCANNER (4 nguồn, song song)
 # ================================================================
@@ -1438,6 +1467,11 @@ def _execute_buy(token: dict):
     chain     = token.get("chain", "solana")
     usdc_addr = BASE_USDC if chain == "base" else SOL_USDC
 
+    # Lấy balance TRƯỚC swap để tính delta nhận token chính xác
+    decimals       = get_token_decimals(addr, chain=chain)
+    bal_before_raw = get_token_raw_balance(addr, chain=chain)
+    bal_before     = int(bal_before_raw) if bal_before_raw.isdigit() else 0
+
     print(f"[Buyer] 🟢 {sym} [{chain.upper()}] | Score: {score}/100 → MUA {BUY_AMOUNT_USDC} USDC")
     sig = execute_swap(usdc_addr, addr, _usdc_raw(BUY_AMOUNT_USDC),
                        label=f"BUY {sym}", chain=chain)
@@ -1451,12 +1485,6 @@ def _execute_buy(token: dict):
     db_save_position(token, sig, BUY_AMOUNT_USDC)
     db_add_blacklist(addr)
     print(f"[Buyer] ✅ {sym} | sig: {sig[:20]}... → xác nhận balance...")
-
-    # ── Lấy balance trước swap để tính delta chính xác ──────────────
-    # Phải lấy TRƯỚC khi gửi TX để tính delta = token nhận được thực tế
-    decimals      = get_token_decimals_rpc(addr) if chain == "solana" else 18
-    bal_before_raw = get_token_raw_balance(addr, chain=chain)
-    bal_before     = int(bal_before_raw) if bal_before_raw.isdigit() else 0
 
     # Background: poll TX confirm → đọc balance sau → tính actual_price
     def _confirm_entry():
