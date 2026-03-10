@@ -1,72 +1,53 @@
 ---
 name: openclaw-solana-meme-bot
-description: Operate, configure, and continuously improve the modular Solana meme trading bot for OpenClaw. Use when users ask to run the bot, switch profiles, validate runtime setup, or build a full self-learning loop (data collection, training, evaluation, promotion, canary, rollback).
+description: Operate, configure, and optimize the modular Solana meme trading bot project for OpenClaw usage. Use when users ask to run the bot, switch strategy profiles, validate .env/runtime setup, inspect trading health, or prepare a daily improvement loop without changing core algorithm logic.
 ---
 
 # OpenClaw Solana Meme Bot
 
-Run and improve the bot in `solana-meme-bot/` using safe workflows.
+Operate the bot in `solana-meme-bot/` with safe, repeatable steps. Prefer profile/config tuning and operational checks over editing `core/engine_legacy.py`.
 
-## Workflow selector
+## Quick workflow
 
-1. **Ops mode (fast)**: run bot, switch profile, validate `.env`, monitor KPIs.
-2. **Self-learning mode (full)**: bootstrap ML pipeline, train daily offline, promote model only when guardrails pass.
+1. Validate runtime prerequisites and `.env`.
+2. Select profile (`early_sniper` or `safe_trend`) and apply it.
+3. Run bot from project root (`python main.py`).
+4. Observe logs and key risk metrics.
+5. Do daily tuning by updating profile parameters, not core trading logic.
 
-## Ops mode
+## Execution rules
 
-### Commands
+- Keep algorithm DNA intact: avoid changing scoring/entry/exit logic in `core/engine_legacy.py` unless explicitly requested.
+- Use `scripts/run_bot.sh` to start consistently.
+- Use `scripts/switch_profile.sh <profile>` to switch between tested presets.
+- If `.env` misses mandatory keys, stop and report exactly which keys are missing.
+- For improvements, change profile values first; only propose code changes after profile A/B evidence.
 
-Run from repository root:
+## Commands
+
+From repository root:
 
 ```bash
-# validate setup
+# 1) Validate environment and files
 bash skills/openclaw-solana-meme-bot/scripts/check_setup.sh
 
-# switch profile
+# 2) Switch profile
 bash skills/openclaw-solana-meme-bot/scripts/switch_profile.sh early_sniper
 # or
 bash skills/openclaw-solana-meme-bot/scripts/switch_profile.sh safe_trend
 
-# run bot
+# 3) Start bot
 bash skills/openclaw-solana-meme-bot/scripts/run_bot.sh
 ```
 
-### Rules
+## Daily optimization loop (without changing core logic)
 
-- Keep core trading logic unchanged unless user explicitly asks.
-- Tune profiles first; change code only after A/B evidence.
-- Keep required env keys present before every run.
-
-## Self-learning mode (full)
-
-### 1) Bootstrap ML scaffold
-
-```bash
-python skills/openclaw-solana-meme-bot/scripts/bootstrap_self_learning.py
-```
-
-This creates a minimal pipeline in `solana-meme-bot/ml/` and appends optional ML env knobs.
-
-### 2) Daily loop
-
-1. Export latest trading events/features.
-2. Build training dataset with clear labels and reward definition.
-3. Train candidate model offline.
-4. Evaluate candidate vs champion.
-5. Promote only if all guardrails pass.
-6. Deploy in shadow/canary before full traffic.
-7. Auto-rollback on degradation.
-
-Use `references/self-learning-full.md` for thresholds and promotion policy.
-
-### 3) Safety guardrails
-
-- Never remove hard risk limits.
-- Never hot-swap to full allocation directly.
-- Always maintain previous champion artifact for rollback.
+- Use `references/daily-ops.md` for the checklist.
+- Compare KPI between profiles over equal market windows.
+- Update only profile knobs first (scan interval, slippage, TP/trailing, risk caps).
+- Keep rollback path: preserve yesterday’s `.env` before applying new profile.
 
 ## References
 
-- `references/env-keys.md`
-- `references/daily-ops.md`
-- `references/self-learning-full.md`
+- Use `references/env-keys.md` for required environment keys and profile-safe keys.
+- Use `references/daily-ops.md` for A/B routine and profitability guardrails.
