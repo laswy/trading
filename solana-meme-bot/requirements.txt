@@ -1,0 +1,6 @@
+requests
+python-dotenv
+base58
+PyNaCl
+web3
+numpy
