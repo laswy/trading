@@ -21,7 +21,6 @@ BASELINE = {
     "TP1_PCT": "25",
     "TP2_PCT": "60",
     "TRAIL_TRIGGER_PCT": "20",
-    "TRAILING_START_PCT": "20",
     "TRAILING_STOP_PCT": "10",
     "VOLUME_SPIKE_MULTIPLIER": "2",
     "MIN_LP_SOL": "5",
@@ -93,10 +92,6 @@ def optimize_params(trades: list[dict]) -> dict[str, str]:
     elif avg_profit < 20:
         cfg["TP2_PCT"] = "50"
         cfg["TRAIL_TRIGGER_PCT"] = "18"
-        cfg["TRAILING_START_PCT"] = "18"
-
-    # Keep alias keys in sync (TRAIL_TRIGGER_PCT <-> TRAILING_START_PCT)
-    cfg["TRAILING_START_PCT"] = cfg.get("TRAIL_TRIGGER_PCT", cfg.get("TRAILING_START_PCT", "20"))
 
     return cfg
 
