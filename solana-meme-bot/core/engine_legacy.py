@@ -309,16 +309,24 @@ BUY_AMOUNT_USDC       = float(os.getenv("BUY_AMOUNT_USDC",       "10"))    # kep
 # Default: 95 (top-tier signals only).
 SELL_MODE      = os.getenv("SELL_MODE",      "sell").strip().lower()   # "sell" | "hold" | "smart"
 HOLD_MIN_SCORE = int(os.getenv("HOLD_MIN_SCORE", "95"))                # used when SELL_MODE=smart
-MIN_SCORE             = int(  os.getenv("MIN_OPPORTUNITY_SCORE",  "70"))
+MIN_SCORE             = int(  os.getenv("MIN_OPPORTUNITY_SCORE",  "83"))
 TAKE_PROFIT_PCT       = float(os.getenv("TAKE_PROFIT_PCT",        "30"))
 # ── Trailing Stop config ───────────────────────────────────────────
-TRAIL_TRIGGER_PCT     = float(os.getenv("TRAIL_TRIGGER_PCT",      "20"))  # lãi % bắt đầu trailing
-TRAIL_TARGET_PCT      = float(os.getenv("TRAIL_TARGET_PCT",       "30"))  # lãi % chốt luôn không đợi
+TP1_PCT               = float(os.getenv("TP1_PCT",                "25"))
+TP2_PCT               = float(os.getenv("TP2_PCT",                "60"))
+TRAIL_TRIGGER_PCT     = float(os.getenv("TRAIL_TRIGGER_PCT",      os.getenv("TRAILING_START_PCT", "20")))
+TRAILING_STOP_PCT     = float(os.getenv("TRAILING_STOP_PCT",      "10"))
+TRAIL_TARGET_PCT      = float(os.getenv("TRAIL_TARGET_PCT",       os.getenv("TP2_PCT", "60")))
 SLIPPAGE_PCT          = float(os.getenv("SLIPPAGE_PCT",           "10"))
 SCAN_INTERVAL         = float(os.getenv("SCAN_INTERVAL_SECONDS",  "3"))
 TP_CHECK_INTERVAL     = float(os.getenv("TP_CHECK_INTERVAL_SECONDS", "5"))
 MIN_LIQUIDITY_USD     = float(os.getenv("MIN_LIQUIDITY_USD",      "5000"))
 MAX_AGE_MIN           = float(os.getenv("MAX_TOKEN_AGE_MINUTES",  "120"))
+MIN_TOKEN_AGE_S       = float(os.getenv("MIN_TOKEN_AGE_S",        "90"))
+MIN_HOLDER_COUNT      = int(  os.getenv("MIN_HOLDER_COUNT",       "5"))
+MAX_TOP10_HOLDER_PCT  = float(os.getenv("MAX_TOP10_HOLDER_PCT",   "20"))
+VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", "2"))
+MIN_LP_SOL            = float(os.getenv("MIN_LP_SOL",             "5"))
 
 # ── Adaptive TP Check intervals (theo tuổi token) ─────────────────
 TP_CHECK_INTERVAL_NEW   = float(os.getenv("TP_CHECK_NEW_S",    "1"))   # token < 5p
@@ -1000,6 +1008,7 @@ class PriceTracker:
 
 _price_tracker = PriceTracker()
 _trailing_peaks: dict = {}  # mint -> peak_price khi đang trailing
+_tp1_alerted: set = set()
 
 # ================================================================
 # RISK MANAGER  (Daily limits + position caps)
@@ -2914,6 +2923,8 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         "volume_1h":        float(vol.get("h1", 0) or 0),
         "volume_6h":        float(vol.get("h6", 0) or 0),
         "volume_24h":       float(vol.get("h24", 0) or 0),
+        "volume_30s":       float(vol.get("m5", 0) or 0) / 10.0,
+        "volume_5m_avg":    float(vol.get("h1", 0) or 0) / 12.0,
         # Txns theo từng khung
         "buys_5m":          txns.get("m5", {}).get("buys", 0),
         "sells_5m":         txns.get("m5", {}).get("sells", 0),
@@ -3960,19 +3971,41 @@ def _validate_one(token: dict) -> Optional[dict]:
     except Exception:
         holder_count = 0
 
-    if top10_pct > 50:
-        print(f"[Validator] 🚫 {sym}: Top10 holder {top10_pct:.0f}% (>50%)")
+    if top10_pct > MAX_TOP10_HOLDER_PCT:
+        print(f"[Validator] 🚫 {sym}: Top10 holder {top10_pct:.0f}% (>{MAX_TOP10_HOLDER_PCT:.0f}%)")
         return None
 
-    if holder_count > 0 and holder_count < 10:
-        print(f"[Validator] 🚫 {sym}: Chỉ {holder_count} holders (quá ít)")
+    if holder_count > 0 and holder_count < MIN_HOLDER_COUNT:
+        print(f"[Validator] 🚫 {sym}: Chỉ {holder_count} holders (<{MIN_HOLDER_COUNT})")
+        return None
+
+    # Token age filter (anti-rug giai đoạn vừa deploy)
+    if age_min is not None and age_min * 60 < MIN_TOKEN_AGE_S:
+        print(f"[Validator] 🚫 {sym}: Token age {age_min*60:.0f}s < {MIN_TOKEN_AGE_S:.0f}s")
+        return None
+
+    # Volume spike filter: chỉ vào khi có đột biến vol ngắn hạn
+    vol_30s = float(token.get("volume_30s", 0) or 0)
+    vol_5m_avg = float(token.get("volume_5m_avg", 0) or 0)
+    if vol_5m_avg <= 0 or vol_30s <= vol_5m_avg * VOLUME_SPIKE_MULTIPLIER:
+        print(f"[Validator] 🚫 {sym}: Volume spike chưa đạt ({vol_30s:.0f} <= {vol_5m_avg:.0f}×{VOLUME_SPIKE_MULTIPLIER:.1f})")
         return None
 
     # Liq hard floor — dùng MIN_LIQUIDITY_USD dynamic (min 3K tuyệt đối)
     liq_floor = max(3_000.0, cfg("MIN_LIQUIDITY_USD") or MIN_LIQUIDITY_USD)
-    if token.get("liquidity_usd", 0) < liq_floor:
-        print(f"[Validator] 🚫 {sym}: Liq ${token['liquidity_usd']:.0f} < ${liq_floor:.0f}")
+    liq_usd = float(token.get("liquidity_usd", 0) or 0)
+    if liq_usd < liq_floor:
+        print(f"[Validator] 🚫 {sym}: Liq ${liq_usd:.0f} < ${liq_floor:.0f}")
         return None
+
+    # Liquidity filter theo SOL: LP >= 5 SOL
+    if chain == "solana":
+        sol_price = get_sol_price_usd(max_age_s=60.0)
+        lp_sol = (liq_usd / sol_price) if sol_price > 0 else 0.0
+        token["lp_sol"] = lp_sol
+        if lp_sol < MIN_LP_SOL:
+            print(f"[Validator] 🚫 {sym}: LP {lp_sol:.2f} SOL < {MIN_LP_SOL:.2f} SOL")
+            return None
 
     # ── LP status (Solana only) ───────────────────────────────────
     token["lp_status"] = check_lp_status(addr) if chain == "solana" else "n/a"
@@ -4080,15 +4113,15 @@ ENTRY_ULTRA_DIP_S       = float(os.getenv("ENTRY_ULTRA_DIP_S",       "1"))   # g
 ENTRY_ULTRA_VOL_PCT     = float(os.getenv("ENTRY_ULTRA_VOL_PCT",     "20"))  # % volume tăng tối thiểu
 
 # ── Chiến lược 2: Dip 3s + RSI Filter (1-5p) ─────────────────────
-ENTRY_DIP_WINDOW_S      = float(os.getenv("ENTRY_DIP_WINDOW_S",      "3"))   # giây chờ dip
+ENTRY_DIP_WINDOW_S      = float(os.getenv("ENTRY_DIP_WINDOW_S",      "5"))   # giây chờ dip
 ENTRY_RSI_PERIOD        = int(  os.getenv("ENTRY_RSI_PERIOD",        "14"))  # period RSI
 ENTRY_RSI_OVERBOUGHT    = float(os.getenv("ENTRY_RSI_OVERBOUGHT",    "70"))  # RSI > 70 → bỏ qua
 ENTRY_RSI_OVERSOLD      = float(os.getenv("ENTRY_RSI_OVERSOLD",      "30"))  # RSI < 30 → ưu tiên mua
 
 # ── Chiến lược 3: BBL 45s + MACD Cross (5-30p) ───────────────────
-ENTRY_BBL_WINDOW_S      = float(os.getenv("ENTRY_BBL_WINDOW_S",     "45"))  # giây chờ BBL (tăng từ 30 → 45)
+ENTRY_BBL_WINDOW_S      = float(os.getenv("ENTRY_BBL_WINDOW_S",     "15"))  # giây chờ BBL
 ENTRY_BBL_PERIOD        = int(  os.getenv("ENTRY_BBL_PERIOD",        "14"))  # số nến BBL
-ENTRY_BBL_STD           = float(os.getenv("ENTRY_BBL_STD",           "2.0")) # std dev BBL
+ENTRY_BBL_STD           = float(os.getenv("ENTRY_BBL_STD",           "1.8")) # std dev BBL
 ENTRY_BBL_TOUCH_TOL_PCT = float(os.getenv("ENTRY_BBL_TOUCH_TOL_PCT", "1.5"))# tolerance % so BBL
 ENTRY_BBL_POLL_S        = float(os.getenv("ENTRY_BBL_POLL_S",        "2"))   # poll mỗi N giây
 ENTRY_MACD_FAST         = int(  os.getenv("ENTRY_MACD_FAST",         "12"))  # MACD fast EMA
@@ -5044,36 +5077,39 @@ def monitor_thread(stop_event: threading.Event):
                 should_sell_tp = False
                 tp_reason      = ""
 
-                if pct >= TRAIL_TARGET_PCT:
-                    # Đạt mục tiêu tối đa → chốt luôn
+                if pct >= TP2_PCT:
+                    # Đạt TP2 → chốt luôn
                     should_sell_tp = True
-                    tp_reason      = f"🎯 TP tối đa +{pct:.1f}% (≥{TRAIL_TARGET_PCT:.0f}%)"
+                    tp_reason      = f"🎯 TP2 +{pct:.1f}% (≥{TP2_PCT:.0f}%)"
                     _trailing_peaks.pop(mint, None)
+                    _tp1_alerted.discard(mint)
 
                 elif pct >= TRAIL_TRIGGER_PCT:
-                    # Vào vùng trailing
+                    # Vào vùng trailing (TRAILING_START)
                     if mint not in _trailing_peaks:
-                        # Lần đầu chạm ngưỡng → ghi peak, chưa bán
                         _trailing_peaks[mint] = cur
+                        if mint not in _tp1_alerted and pct >= TP1_PCT:
+                            _tp1_alerted.add(mint)
+                            print(f"  [Monitor] 🥇 {sym}: chạm TP1 +{pct:.1f}% (≥{TP1_PCT:.0f}%)")
                         print(f"  [Monitor] 🔔 {sym}: +{pct:.1f}% → BẮT ĐẦU TRAILING "
-                              f"(peak=${cur:.10f}, target={TRAIL_TARGET_PCT:.0f}%)")
+                              f"(peak=${cur:.10f}, stop={TRAILING_STOP_PCT:.0f}%, TP2={TP2_PCT:.0f}%)")
                     else:
                         prev_peak = _trailing_peaks[mint]
                         if cur > prev_peak:
-                            # Giá vẫn tăng → cập nhật peak
                             _trailing_peaks[mint] = cur
                             print(f"  [Monitor] 📈 {sym}: trailing peak cập nhật "
                                   f"${prev_peak:.10f} → ${cur:.10f} (+{pct:.1f}%)")
                         else:
-                            # Giá giảm so với tick trước → chốt ngay
-                            should_sell_tp = True
-                            tp_reason      = (f"🔔 Trailing chốt: giá giảm từ "
-                                              f"${prev_peak:.10f} → ${cur:.10f} "
-                                              f"(+{pct:.1f}%)")
-                            _trailing_peaks.pop(mint, None)
+                            drop_from_peak_pct = ((prev_peak - cur) / prev_peak * 100) if prev_peak > 0 else 0
+                            if drop_from_peak_pct >= TRAILING_STOP_PCT:
+                                should_sell_tp = True
+                                tp_reason      = (f"🔔 Trailing stop {drop_from_peak_pct:.1f}% "
+                                                  f"(≥{TRAILING_STOP_PCT:.0f}%) từ peak ${prev_peak:.10f}")
+                                _trailing_peaks.pop(mint, None)
+                                _tp1_alerted.discard(mint)
                 else:
-                    # Chưa đủ ngưỡng trailing, xóa peak nếu có (giá rớt lại)
                     _trailing_peaks.pop(mint, None)
+                    _tp1_alerted.discard(mint)
 
                 if should_sell_tp:
                     # ── HOLD mode: alert but do not sell ──────────────
