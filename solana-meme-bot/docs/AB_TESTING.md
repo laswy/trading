@@ -30,3 +30,14 @@ Script sẽ merge profile vào `.env`, giữ lại các biến nhạy cảm đã
 - PnL net/ngày
 - Max drawdown nội ngày
 - Số lần FAST_DUMP exit
+
+## Auto Parameter Optimizer
+
+Tự động đề xuất/ghi đè bộ tham số theo trade log:
+
+```bash
+python scripts/auto_parameter_optimizer.py
+python scripts/auto_parameter_optimizer.py --apply
+```
+
+Các tham số tối ưu gồm: score ngưỡng, bộ TP/trailing, volume spike, LP SOL tối thiểu, token age filter.
