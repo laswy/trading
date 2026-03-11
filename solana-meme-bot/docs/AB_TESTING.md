@@ -1,5 +1,8 @@
 # A/B Profile Testing Guide
 
+> Hướng dẫn vận hành đầy đủ: `docs/USAGE_GUIDE.md`.
+
+
 ## Mục tiêu
 A/B test 2 cấu hình mà **không thay đổi logic thuật toán** trong `core/engine_legacy.py`.
 

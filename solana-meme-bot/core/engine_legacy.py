@@ -366,6 +366,46 @@ BUY_TXN_BY_AGE = [
     (None, int(os.getenv("BUY_TXN_AGE_OVER60", "30"))),
 ]
 
+
+PROFILE_PRESETS: Dict[str, Dict[str, str]] = {
+    "early_sniper": {
+        "MIN_SCORE": "83",
+        "SCAN_INTERVAL": "2",
+        "TP_CHECK_INTERVAL_NEW": "1",
+        "TP_CHECK_INTERVAL_MID": "3",
+        "TP_CHECK_INTERVAL_OLD": "8",
+        "SLIPPAGE_PCT": "12",
+        "SLIPPAGE_TOKEN_NEW": "35",
+        "SLIPPAGE_TOKEN_MID": "18",
+        "PRIORITY_FEE_DEFAULT": "150000",
+        "PRIORITY_FEE_HIGH": "650000",
+        "PRIORITY_FEE_VERY_HIGH": "1200000",
+        "FAST_DUMP_PCT": "-12",
+        "FAST_DUMP_WINDOW_S": "8",
+        "RISK_MAX_POSITIONS": "4",
+        "RISK_MAX_DAILY_TRADES": "25",
+        "RISK_MAX_DAILY_LOSS": "40",
+    },
+    "safe_trend": {
+        "MIN_SCORE": "83",
+        "SCAN_INTERVAL": "4",
+        "TP_CHECK_INTERVAL_NEW": "2",
+        "TP_CHECK_INTERVAL_MID": "6",
+        "TP_CHECK_INTERVAL_OLD": "12",
+        "SLIPPAGE_PCT": "8",
+        "SLIPPAGE_TOKEN_NEW": "25",
+        "SLIPPAGE_TOKEN_MID": "12",
+        "PRIORITY_FEE_DEFAULT": "100000",
+        "PRIORITY_FEE_HIGH": "450000",
+        "PRIORITY_FEE_VERY_HIGH": "900000",
+        "FAST_DUMP_PCT": "-15",
+        "FAST_DUMP_WINDOW_S": "10",
+        "RISK_MAX_POSITIONS": "3",
+        "RISK_MAX_DAILY_TRADES": "15",
+        "RISK_MAX_DAILY_LOSS": "30",
+    },
+}
+
 # ================================================================
 # DYNAMIC CONFIG  — chỉnh runtime qua Telegram /set
 # ================================================================
@@ -5398,6 +5438,9 @@ _MAIN_MENU_KB = [
         {"text": "⚙️ Cài Đặt",    "callback_data": "cb_config"},
     ],
     [
+        {"text": "🧪 Profile A/B", "callback_data": "cb_profiles"},
+    ],
+    [
         {"text": "🔓 Unblock",     "callback_data": "cb_unblock"},
         {"text": "💾 Lưu .env",    "callback_data": "cb_save"},
         {"text": "❓ Hướng Dẫn",   "callback_data": "cb_help"},
@@ -5415,8 +5458,43 @@ _CONFIG_GROUP_KB = [
         {"text": "⏱ Timing",     "callback_data": "cb_cfg_timing"},
         {"text": "📐 Slippage",   "callback_data": "cb_cfg_slippage"},
     ],
+    [{"text": "🧪 Profile A/B", "callback_data": "cb_profiles"}],
     [{"text": "🔙 Menu Chính",   "callback_data": "cb_menu"}],
 ]
+
+
+def _content_profiles() -> str:
+    return (
+        "🧪 <b>Profile A/B</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Chọn cấu hình chạy nhanh:\n"
+        "• <b>⚡ Early Sniper</b> — phản ứng nhanh, fill cao\n"
+        "• <b>🛡 Safe Trend</b> — an toàn hơn, giảm churn\n\n"
+        "Lệnh text tương đương:\n"
+        "<code>/profile early_sniper</code>\n"
+        "<code>/profile safe_trend</code>\n"
+        "Sau khi áp dụng, dùng <code>/save</code> để lưu .env."
+    )
+
+
+def _apply_profile_runtime(profile_name: str) -> Tuple[bool, str]:
+    profile_key = (profile_name or "").strip().lower()
+    preset = PROFILE_PRESETS.get(profile_key)
+    if not preset:
+        return False, "Profile không hợp lệ. Dùng: early_sniper | safe_trend"
+
+    changed = []
+    for key, val in preset.items():
+        ok, msg = cfg_set(key, val)
+        if ok:
+            changed.append(key)
+        else:
+            return False, f"Không áp dụng được {key}: {msg}"
+
+    return True, (
+        f"✅ Đã áp dụng profile <b>{profile_key}</b> ({len(changed)} thông số).\n"
+        "💾 Dùng /save để lưu vào .env."
+    )
 
 
 def _show_menu(chat_id: str, edit_msg_id: int = None):
@@ -5612,7 +5690,8 @@ def _content_guide() -> str:
         "<code>/set KEY VALUE</code> — Thay đổi thông số ngay\n"
         "<code>/save</code> — Lưu vào .env\n"
         "<code>/block MINT</code> — Block nhanh\n"
-        "<code>/sell MINT</code> — Bán nhanh\n\n"
+        "<code>/sell MINT</code> — Bán nhanh\n"
+        "<code>/profile early_sniper|safe_trend</code> — Đổi profile A/B\n\n"
         "⚙️ <b>Ví dụ /set:</b>\n"
         "<code>/set BUY_AMOUNT_SOL 0.05</code>\n"
         "<code>/set MIN_SCORE 80</code>\n"
@@ -5679,6 +5758,25 @@ def _handle_callback(cb: dict):
         kb    = [[{"text": "🔙 Cài Đặt", "callback_data": "cb_config"},
                   {"text": "🏠 Menu",    "callback_data": "cb_menu"}]]
         _edit_reply(chat_id, msg_id, _content_config(group), kb)
+
+    elif data == "cb_profiles":
+        kb = [
+            [{"text": "⚡ Early Sniper", "callback_data": "cb_profile_early_sniper"}],
+            [{"text": "🛡 Safe Trend",  "callback_data": "cb_profile_safe_trend"}],
+            [{"text": "🔙 Cài Đặt", "callback_data": "cb_config"},
+             {"text": "🏠 Menu",   "callback_data": "cb_menu"}],
+        ]
+        _edit_reply(chat_id, msg_id, _content_profiles(), kb)
+
+    elif data.startswith("cb_profile_"):
+        prof = data.replace("cb_profile_", "", 1)
+        ok, msg_txt = _apply_profile_runtime(prof)
+        kb = [
+            [{"text": "🧪 Profile A/B", "callback_data": "cb_profiles"}],
+            [{"text": "💾 Lưu .env", "callback_data": "cb_save"},
+             {"text": "🏠 Menu", "callback_data": "cb_menu"}],
+        ]
+        _edit_reply(chat_id, msg_id, msg_txt if ok else f"❌ {msg_txt}", kb)
 
     # ── Bán — yêu cầu nhập mint ──────────────────────────────────
     elif data == "cb_sell":
@@ -5922,6 +6020,18 @@ def _handle_text_command(chat_id: str, text: str):
         icon = "💾" if ok else "❌"
         _reply(chat_id, f"{icon} {msg_txt}", _BACK_KB)
 
+    elif command == "/profile":
+        if not arg:
+            kb = [
+                [{"text": "⚡ Early Sniper", "callback_data": "cb_profile_early_sniper"}],
+                [{"text": "🛡 Safe Trend",  "callback_data": "cb_profile_safe_trend"}],
+                [{"text": "🔙 Menu Chính", "callback_data": "cb_menu"}],
+            ]
+            _reply(chat_id, _content_profiles(), kb)
+            return
+        ok, msg_txt = _apply_profile_runtime(arg)
+        _reply(chat_id, msg_txt if ok else f"❌ {msg_txt}", _BACK_KB)
+
     elif command == "/block":
         if not arg:
             with _tg_state_lock:
@@ -6006,18 +6116,6 @@ def _process_update(update: dict):
 
 
 # ── Polling thread ────────────────────────────────────────────────
-
-def _show_menu(chat_id: str, edit_msg_id: int = None):
-    text = (
-        "🤖 <b>MULTI-CHAIN TRADER</b> — Menu Điều Khiển\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Chọn chức năng bên dưới 👇"
-    )
-    if edit_msg_id:
-        _edit_reply(chat_id, edit_msg_id, text, _MAIN_MENU_KB)
-    else:
-        _reply(chat_id, text, _MAIN_MENU_KB)
-
 
 def telegram_cmd_thread(stop_event: threading.Event):
     """
