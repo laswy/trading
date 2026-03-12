@@ -919,6 +919,7 @@ GOPLUS_NONCRIT  = {
 }
 
 DB_PATH = "positions.db"
+SCORE_HISTORY_PATH = Path(__file__).resolve().parents[1] / "data" / "score_history.jsonl"
 
 # ── Early alert: token < 2 phút → gửi 1 lần dù chưa đủ score ────
 EARLY_ALERT_MAX_AGE_MIN = float(os.getenv("EARLY_ALERT_MAX_AGE_MIN", "2"))
@@ -1597,23 +1598,124 @@ def _get_min_buys(age_min: Optional[float]) -> int:
             return min_buys
     return 30
 
+_score_history_lock = threading.Lock()
+
+def _log_score_snapshot(token: dict, score: int, min_score: int) -> None:
+    """Lưu lịch sử chấm điểm để theo dõi mặt bằng thị trường theo thời gian."""
+    rec = {
+        "ts": int(time.time()),
+        "chain": token.get("chain", "solana"),
+        "symbol": token.get("symbol", "?"),
+        "address": token.get("address", ""),
+        "score": int(score),
+        "min_score": int(min_score),
+        "tradable": bool(score >= min_score),
+        "age_min": round(float(token.get("token_age_minutes") or 0), 2),
+        "liq_usd": round(float(token.get("liquidity_usd") or 0), 2),
+        "vol_1h": round(float(token.get("volume_1h") or 0), 2),
+    }
+
+    try:
+        with _score_history_lock:
+            SCORE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with SCORE_HISTORY_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[ScoreHistory] ⚠️  Không ghi được score history: {e}")
+
+
+def _content_score_history(limit: int = 200) -> str:
+    """Tóm tắt lịch sử score gần nhất để ước lượng mặt bằng có thể trade."""
+    try:
+        if not SCORE_HISTORY_PATH.exists():
+            return (
+                "📊 <b>Lịch sử chấm điểm</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📭 Chưa có dữ liệu score. Hãy để bot chạy thêm vài phút rồi thử lại."
+            )
+
+        lines = SCORE_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            return (
+                "📊 <b>Lịch sử chấm điểm</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📭 File score history đang rỗng."
+            )
+
+        raw = lines[-max(1, int(limit)):]
+        rows = []
+        for ln in raw:
+            try:
+                rows.append(json.loads(ln))
+            except Exception:
+                continue
+
+        if not rows:
+            return "📊 <b>Lịch sử chấm điểm</b>\n━━━━━━━━━━━━━━━━━━━━\n⚠️ Dữ liệu score bị lỗi format."
+
+        scores = [int(r.get("score", 0)) for r in rows]
+        scores_sorted = sorted(scores)
+        total = len(scores)
+        avg = sum(scores) / total
+        med = scores_sorted[total // 2] if total % 2 == 1 else (scores_sorted[total // 2 - 1] + scores_sorted[total // 2]) / 2
+        p75 = scores_sorted[min(total - 1, int(total * 0.75))]
+
+        cur_min_score = int(cfg("MIN_SCORE") or MIN_SCORE)
+        over70 = sum(1 for s in scores if s >= 70)
+        tradable = sum(1 for s in scores if s >= cur_min_score)
+
+        recent = sorted(rows, key=lambda x: int(x.get("ts", 0)), reverse=True)[:12]
+        token_lines = []
+        for r in recent:
+            sym = r.get("symbol", "?")
+            sc = int(r.get("score", 0))
+            ch = "SOL" if r.get("chain") == "solana" else "BASE"
+            icon = "✅" if sc >= cur_min_score else "⏭"
+            token_lines.append(f"{icon} <b>${sym}</b> [{ch}] — {sc}/100")
+
+        return (
+            "📊 <b>Lịch sử chấm điểm (gần nhất)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧪 Mẫu: <b>{total}</b> token gần nhất\n"
+            f"🎯 Ngưỡng trade hiện tại: <b>{cur_min_score}</b>\n"
+            f"📈 Trung bình: <b>{avg:.1f}</b> | Median: <b>{med:.1f}</b> | P75: <b>{p75:.1f}</b>\n"
+            f"🟡 >=70 điểm: <b>{over70}</b> ({over70/max(total,1)*100:.1f}%)\n"
+            f"🟢 >=ngưỡng trade: <b>{tradable}</b> ({tradable/max(total,1)*100:.1f}%)\n\n"
+            "<b>12 token quét gần nhất:</b>\n" + "\n".join(token_lines) +
+            "\n\n💡 Dùng lệnh: <code>/scores 500</code> để xem mẫu rộng hơn."
+        )
+    except Exception as ex:
+        return f"❌ Lỗi đọc score history: {ex}"
+
 # ================================================================
 # TELEGRAM
 # ================================================================
 
-def _send_tg(text: str, chat_id: str = None):
+def _send_tg(text: str, chat_id: str = None) -> bool:
+    """Gửi Telegram message. Return True nếu có ít nhất 1 target gửi thành công."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("[TG] ⚠️  TELEGRAM_BOT_TOKEN chưa set — bỏ qua gửi Telegram")
+        return False
+
     targets = [chat_id] if chat_id else (TELEGRAM_SIGNAL_CHANNELS or [TELEGRAM_CHAT_ID])
+    sent_ok = False
     for cid in targets:
-        if not cid: continue
+        if not cid:
+            continue
         try:
-            requests.post(
+            resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": cid, "text": text, "parse_mode": "HTML",
                       "disable_web_page_preview": True},
                 timeout=10
             )
+            if resp.ok:
+                sent_ok = True
+            else:
+                print(f"[TG] ⚠️  sendMessage fail chat_id={cid} status={resp.status_code} body={resp.text[:200]}")
         except Exception as e:
             print(f"[TG] ❌ {e}")
+    return sent_ok
 
 def _alert(text: str):
     if TELEGRAM_CHAT_ID:
@@ -3357,7 +3459,6 @@ def send_signal_alert(token: dict, score: int, detail: list):
     with _signal_alert_lock:
         if addr in _signal_alert_sent:
             return
-        _signal_alert_sent.add(addr)
 
     chain      = token.get("chain", "solana")
     sym        = token.get("symbol", "?")
@@ -3491,14 +3592,20 @@ def send_signal_alert(token: dict, score: int, detail: list):
     )
 
     # Gửi đến signal channels (cho bạn bè)
+    sent_ok = False
     if TELEGRAM_SIGNAL_CHANNELS:
         for cid in TELEGRAM_SIGNAL_CHANNELS:
-            _send_tg(msg, chat_id=cid)
+            sent_ok = _send_tg(msg, chat_id=cid) or sent_ok
     else:
         # Fallback: gửi vào chat chính nếu không có channel riêng
-        _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
+        sent_ok = _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
 
-    print(f"[Signal] 🚨 Signal gửi: {sym} [{chain}] score={score} ({strategy_tag})")
+    if sent_ok:
+        with _signal_alert_lock:
+            _signal_alert_sent.add(addr)
+        print(f"[Signal] 🚨 Signal gửi: {sym} [{chain}] score={score} ({strategy_tag})")
+    else:
+        print(f"[Signal] ⚠️  Không gửi được signal: {sym} [{chain}] score={score}")
 
 
 def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
@@ -4065,6 +4172,7 @@ def _validate_one(token: dict) -> Optional[dict]:
     token["_score_detail"] = detail
 
     _min_score = int(cfg("MIN_SCORE") or MIN_SCORE)
+    _log_score_snapshot(token, score, _min_score)
     age_log = f"{age_min:.0f}p" if age_min is not None else "N/A"
     flag = "✅" if score >= _min_score else "⏭ "
     print(f"[Validator] {flag} {sym:<10} | Score:{score}/100 | "
@@ -5691,7 +5799,7 @@ def _content_guide() -> str:
         "<code>/save</code> — Lưu vào .env\n"
         "<code>/block MINT</code> — Block nhanh\n"
         "<code>/sell MINT</code> — Bán nhanh\n"
-        "<code>/profile early_sniper|safe_trend</code> — Đổi profile A/B\n\n"
+        "<code>/profile early_sniper|safe_trend</code> — Đổi profile A/B\n<code>/scores [N]</code> — Xem thống kê điểm token vừa quét\n\n"
         "⚙️ <b>Ví dụ /set:</b>\n"
         "<code>/set BUY_AMOUNT_SOL 0.05</code>\n"
         "<code>/set MIN_SCORE 80</code>\n"
@@ -5979,6 +6087,14 @@ def _handle_text_command(chat_id: str, text: str):
 
     elif command == "/report":
         _reply(chat_id, _content_report(), _BACK_KB)
+
+    elif command == "/scores":
+        try:
+            limit = int(arg) if arg else 200
+            limit = max(20, min(limit, 5000))
+        except Exception:
+            limit = 200
+        _reply(chat_id, _content_score_history(limit), _BACK_KB)
 
     elif command == "/config":
         group = arg.lower().strip()
