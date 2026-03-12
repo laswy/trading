@@ -1601,19 +1601,31 @@ def _get_min_buys(age_min: Optional[float]) -> int:
 # TELEGRAM
 # ================================================================
 
-def _send_tg(text: str, chat_id: str = None):
+def _send_tg(text: str, chat_id: str = None) -> bool:
+    """Gửi Telegram message. Return True nếu có ít nhất 1 target gửi thành công."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("[TG] ⚠️  TELEGRAM_BOT_TOKEN chưa set — bỏ qua gửi Telegram")
+        return False
+
     targets = [chat_id] if chat_id else (TELEGRAM_SIGNAL_CHANNELS or [TELEGRAM_CHAT_ID])
+    sent_ok = False
     for cid in targets:
-        if not cid: continue
+        if not cid:
+            continue
         try:
-            requests.post(
+            resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": cid, "text": text, "parse_mode": "HTML",
                       "disable_web_page_preview": True},
                 timeout=10
             )
+            if resp.ok:
+                sent_ok = True
+            else:
+                print(f"[TG] ⚠️  sendMessage fail chat_id={cid} status={resp.status_code} body={resp.text[:200]}")
         except Exception as e:
             print(f"[TG] ❌ {e}")
+    return sent_ok
 
 def _alert(text: str):
     if TELEGRAM_CHAT_ID:
@@ -3357,7 +3369,6 @@ def send_signal_alert(token: dict, score: int, detail: list):
     with _signal_alert_lock:
         if addr in _signal_alert_sent:
             return
-        _signal_alert_sent.add(addr)
 
     chain      = token.get("chain", "solana")
     sym        = token.get("symbol", "?")
@@ -3491,14 +3502,20 @@ def send_signal_alert(token: dict, score: int, detail: list):
     )
 
     # Gửi đến signal channels (cho bạn bè)
+    sent_ok = False
     if TELEGRAM_SIGNAL_CHANNELS:
         for cid in TELEGRAM_SIGNAL_CHANNELS:
-            _send_tg(msg, chat_id=cid)
+            sent_ok = _send_tg(msg, chat_id=cid) or sent_ok
     else:
         # Fallback: gửi vào chat chính nếu không có channel riêng
-        _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
+        sent_ok = _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
 
-    print(f"[Signal] 🚨 Signal gửi: {sym} [{chain}] score={score} ({strategy_tag})")
+    if sent_ok:
+        with _signal_alert_lock:
+            _signal_alert_sent.add(addr)
+        print(f"[Signal] 🚨 Signal gửi: {sym} [{chain}] score={score} ({strategy_tag})")
+    else:
+        print(f"[Signal] ⚠️  Không gửi được signal: {sym} [{chain}] score={score}")
 
 
 def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
