@@ -2962,6 +2962,16 @@ NEW_PAIRS_URLS = [
     "https://api.dexscreener.com/latest/dex/pairs/solana/new",
     "https://api.dexscreener.com/latest/dex/pairs/base/new",
 ]
+GECKO_NEW_POOL_URLS = [
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
+    "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=2",
+]
+
+REQUIRE_SOCIAL_WEB_X = str(os.getenv("REQUIRE_SOCIAL_WEB_X", "1")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
 
 def _extract_social(pair: dict, kind: str) -> str:
     """Lấy URL social từ DexScreener pair.info block."""
@@ -3053,6 +3063,16 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         return None
     vol  = pair.get("volume") or {}
     pc   = pair.get("priceChange") or {}
+    website = _extract_social(pair, "website")
+    twitter = _extract_social(pair, "twitter")
+
+    # Chỉ scan token có đủ website + X/Twitter thật (nếu bật REQUIRE_SOCIAL_WEB_X)
+    if REQUIRE_SOCIAL_WEB_X:
+        w_ok, _ = _validate_website(website) if website else (False, "missing")
+        t_ok, _ = _validate_twitter(twitter) if twitter else (False, "missing")
+        if not (w_ok and t_ok):
+            return None
+
     return {
         "address":          addr,
         "symbol":           (pair.get("baseToken") or {}).get("symbol", ""),
@@ -3085,8 +3105,8 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         "token_age_minutes": age_min,
         "lp_status":         "unknown",
         "chain":             chain_id,
-        "website":           _extract_social(pair, "website"),
-        "twitter":           _extract_social(pair, "twitter"),
+        "website":           website,
+        "twitter":           twitter,
         # GoPlus security data — sẽ được fill bởi _validate_one
         "goplus":            {},
     }
@@ -3174,6 +3194,54 @@ def fetch_new_pairs() -> List[dict]:
         except Exception as e:
             print(f"[Scan-B] ⚠️  {chain_label}: {e}")
     return result
+
+def fetch_gecko_new_pool_addresses() -> List[str]:
+    """
+    Nguồn C: GeckoTerminal new_pools → token addresses.
+    Dùng để mở rộng discovery ngoài DexScreener profile/boost/new.
+    """
+    addrs: List[str] = []
+    seen: set = set()
+    for url in GECKO_NEW_POOL_URLS:
+        cache_key = f"gecko_new:{url.split('/networks/')[-1]}"
+        cached = _dex_cache.get(cache_key, ttl=20)
+        if cached is not None:
+            for addr in cached:
+                if addr not in seen:
+                    seen.add(addr)
+                    addrs.append(addr)
+            continue
+        try:
+            r = requests.get(
+                url,
+                timeout=10,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+            if r.status_code != 200:
+                continue
+            payload = r.json() if isinstance(r.json(), dict) else {}
+            items = payload.get("data") or []
+            batch: List[str] = []
+            for item in items:
+                attrs = item.get("attributes") or {}
+                base_addr = (
+                    attrs.get("base_token_address")
+                    or attrs.get("token_address")
+                    or ""
+                )
+                if not base_addr:
+                    continue
+                batch.append(base_addr)
+                if base_addr not in seen:
+                    seen.add(base_addr)
+                    addrs.append(base_addr)
+            _dex_cache.set(cache_key, batch)
+        except Exception as e:
+            print(f"[Scan-C] ⚠️  gecko new_pools: {e}")
+    return addrs
 
 def get_price_usd(addr: str, chain: str = "solana") -> float:
     """Lấy giá USD từ DexScreener. chain-aware: lọc đúng chainId."""
@@ -3926,17 +3994,44 @@ def scan_once() -> List[dict]:
     Quét token song song:
       Nguồn A: Profile/Boost → fetch tất cả địa chỉ SONG SONG (ThreadPool)
       Nguồn B: /pairs/{chain}/new — chạy đồng thời với Nguồn A
+      Nguồn C: GeckoTerminal new_pools → bổ sung địa chỉ token mới
     Tổng thời gian scan giảm từ ~30s xuống ~3-5s.
     """
     now_ts    = time.time()
     seen_pair: set = set()
     cands: List[dict] = []
 
-    # ── Nguồn A + B chạy đồng thời ───────────────────────────────
-    all_addrs = fetch_profile_addresses()
+    # ── Nguồn A + C chạy đồng thời ───────────────────────────────
+    _profile_addrs_result: List[List[str]] = [[]]
+    _gecko_addrs_result: List[List[str]] = [[]]
+
+    def _fetch_a():
+        _profile_addrs_result[0] = fetch_profile_addresses()
+
+    def _fetch_c():
+        _gecko_addrs_result[0] = fetch_gecko_new_pool_addresses()
+
+    a_thread = threading.Thread(target=_fetch_a, daemon=True)
+    c_thread = threading.Thread(target=_fetch_c, daemon=True)
+    a_thread.start()
+    c_thread.start()
+
+    a_thread.join(timeout=15)
+    c_thread.join(timeout=15)
+
+    all_addrs = []
+    seen_addr: set = set()
+    for addr in (_profile_addrs_result[0] or []) + (_gecko_addrs_result[0] or []):
+        if addr and addr not in seen_addr:
+            seen_addr.add(addr)
+            all_addrs.append(addr)
+
     sol_cnt   = sum(1 for a in all_addrs if len(a) > 42)
     base_cnt  = len(all_addrs) - sol_cnt
-    print(f"  [SCAN-A] {len(all_addrs)} địa chỉ (🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song")
+    print(
+        f"  [SCAN-A+C] {len(all_addrs)} địa chỉ (A:{len(_profile_addrs_result[0])} + C:{len(_gecko_addrs_result[0])}) "
+        f"(🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song"
+    )
 
     # Nguồn B fetch trong thread riêng đồng thời với Nguồn A
     _new_pairs_result: List[list] = [[]]
@@ -4006,7 +4101,7 @@ def scan_once() -> List[dict]:
 
 
 def scanner_thread(stop_event: threading.Event):
-    print("[Scanner] 🟢 Bắt đầu scan (4 nguồn)...")
+    print("[Scanner] 🟢 Bắt đầu scan (đa nguồn: DexScreener + GeckoTerminal)...")
     in_queue: set = set()
     last_clear    = time.time()
 
@@ -4165,6 +4260,10 @@ def _validate_one(token: dict) -> Optional[dict]:
     # ── Validate social links (website + Twitter) ─────────────────
     # Chạy trước calculate_score để scoring dùng kết quả validated
     validate_social_links(token)
+
+    if REQUIRE_SOCIAL_WEB_X and not (token.get("website_valid") and token.get("twitter_valid")):
+        print(f"[Validator] 🚫 {sym}: thiếu Web/X hợp lệ")
+        return None
 
     # ── LỚP 2: Score cơ hội ──────────────────────────────────────
     score, detail = calculate_score(token)
