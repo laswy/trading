@@ -929,8 +929,9 @@ _early_alert_lock       = threading.Lock()
 # ── Signal Alert: token đạt ngưỡng điểm → thông báo cho bạn bè mua ──
 # Gửi đến TELEGRAM_SIGNAL_CHANNELS (tách bạch với TELEGRAM_CHAT_ID của bot)
 SIGNAL_ALERT_MIN_SCORE  = int(os.getenv("SIGNAL_ALERT_MIN_SCORE", "70"))   # ngưỡng điểm gửi signal
-_signal_alert_sent: set = set()    # {mint} đã gửi signal trong session
-_signal_alert_lock      = threading.Lock()
+_signal_alert_sent: set = set()      # {mint} đã gửi signal trong session
+_signal_alert_inflight: set = set()  # {mint} đang gửi signal (dedupe khi gửi song song)
+_signal_alert_lock        = threading.Lock()
 
 # ================================================================
 # QUEUES
@@ -3457,8 +3458,9 @@ def send_signal_alert(token: dict, score: int, detail: list):
     """
     addr = token["address"]
     with _signal_alert_lock:
-        if addr in _signal_alert_sent:
+        if addr in _signal_alert_sent or addr in _signal_alert_inflight:
             return
+        _signal_alert_inflight.add(addr)
 
     chain      = token.get("chain", "solana")
     sym        = token.get("symbol", "?")
@@ -3600,9 +3602,12 @@ def send_signal_alert(token: dict, score: int, detail: list):
         # Fallback: gửi vào chat chính nếu không có channel riêng
         sent_ok = _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
 
-    if sent_ok:
-        with _signal_alert_lock:
+    with _signal_alert_lock:
+        _signal_alert_inflight.discard(addr)
+        if sent_ok:
             _signal_alert_sent.add(addr)
+
+    if sent_ok:
         print(f"[Signal] 🚨 Signal gửi: {sym} [{chain}] score={score} ({strategy_tag})")
     else:
         print(f"[Signal] ⚠️  Không gửi được signal: {sym} [{chain}] score={score}")
