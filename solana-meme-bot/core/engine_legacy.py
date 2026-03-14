@@ -3195,24 +3195,6 @@ def fetch_new_pairs() -> List[dict]:
             print(f"[Scan-B] ⚠️  {chain_label}: {e}")
     return result
 
-def _gecko_token_id_to_address(raw_id: str) -> str:
-    """Chuẩn hoá token id/address từ GeckoTerminal về địa chỉ thuần để query DexScreener."""
-    rid = str(raw_id or "").strip()
-    if not rid:
-        return ""
-
-    # Format thường gặp: "solana_<mint>" hoặc "base_0x..."
-    if "_" in rid:
-        _, tail = rid.split("_", 1)
-        rid = tail.strip()
-
-    # Gecko đôi lúc trả id dưới dạng path-like (vd: /tokens/<addr>)
-    if "/" in rid:
-        rid = rid.rsplit("/", 1)[-1].strip()
-
-    return rid
-
-
 def fetch_gecko_new_pool_addresses() -> List[str]:
     """
     Nguồn C: GeckoTerminal new_pools → token addresses.
@@ -3239,53 +3221,24 @@ def fetch_gecko_new_pool_addresses() -> List[str]:
                 },
             )
             if r.status_code != 200:
-                print(f"[Scan-C] ⚠️  gecko status={r.status_code}: {url}")
                 continue
-
             payload = r.json() if isinstance(r.json(), dict) else {}
             items = payload.get("data") or []
-            included = payload.get("included") or []
-
-            # Map token id -> token address từ included (json:api)
-            included_token_addr: Dict[str, str] = {}
-            for inc in included:
-                inc_id = str(inc.get("id") or "")
-                inc_addr = _gecko_token_id_to_address((inc.get("attributes") or {}).get("address") or inc_id)
-                if inc_id and inc_addr:
-                    included_token_addr[inc_id] = inc_addr
-
             batch: List[str] = []
             for item in items:
                 attrs = item.get("attributes") or {}
-                rels = item.get("relationships") or {}
-
-                # Ưu tiên field address trực tiếp nếu API có
-                base_addr = _gecko_token_id_to_address(
+                base_addr = (
                     attrs.get("base_token_address")
                     or attrs.get("token_address")
-                    or attrs.get("address")
                     or ""
                 )
-
-                # Fallback 1: lấy từ relationships.base_token.data.id
-                base_token_id = ((rels.get("base_token") or {}).get("data") or {}).get("id") or ""
-                if not base_addr:
-                    base_addr = _gecko_token_id_to_address(base_token_id)
-
-                # Fallback 2: map token id -> included.attributes.address
-                if not base_addr and base_token_id:
-                    base_addr = included_token_addr.get(base_token_id, "")
-
                 if not base_addr:
                     continue
-
                 batch.append(base_addr)
                 if base_addr not in seen:
                     seen.add(base_addr)
                     addrs.append(base_addr)
-
             _dex_cache.set(cache_key, batch)
-            print(f"  [Scan-C] {url.split('/networks/')[-1]}: +{len(batch)} token")
         except Exception as e:
             print(f"[Scan-C] ⚠️  gecko new_pools: {e}")
     return addrs
