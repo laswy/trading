@@ -932,6 +932,14 @@ SIGNAL_ALERT_MIN_SCORE  = int(os.getenv("SIGNAL_ALERT_MIN_SCORE", "70"))   # ng�
 _signal_alert_sent: set = set()    # {mint} đã gửi signal trong session
 _signal_alert_lock      = threading.Lock()
 
+TOP_SIGNAL_ENABLED      = str(os.getenv("TOP_SIGNAL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+TOP_SIGNAL_SIZE         = int(os.getenv("TOP_SIGNAL_SIZE", "10"))
+TOP_SIGNAL_INTERVAL_S   = int(os.getenv("TOP_SIGNAL_INTERVAL_S", "90"))
+TOP_SIGNAL_MAX_CANDIDATES = int(os.getenv("TOP_SIGNAL_MAX_CANDIDATES", "200"))
+_top_signal_pool: Dict[str, dict] = {}   # {mint: {score, symbol, ...}}
+_top_signal_lock        = threading.Lock()
+_last_top_signal_sent_ts = 0.0
+
 # ================================================================
 # QUEUES
 # ================================================================
@@ -3511,6 +3519,107 @@ def send_early_alert(token: dict):
     print(f"[Scanner] ⚡ Early alert gửi: {sym} [{chain}] tuổi={age_str}")
 
 
+def _update_top_signal_pool(token: dict, score: int):
+    """Lưu candidate vào pool để gửi bảng xếp hạng top score lên group."""
+    if score < SIGNAL_ALERT_MIN_SCORE:
+        return
+    addr = token.get("address", "")
+    if not addr:
+        return
+
+    row = {
+        "address": addr,
+        "symbol": token.get("symbol", "?"),
+        "name": token.get("name", token.get("symbol", "?")),
+        "chain": token.get("chain", "solana"),
+        "score": int(score),
+        "liq": float(token.get("liquidity_usd", 0) or 0),
+        "age": token.get("token_age_minutes", None),
+        "pair_address": token.get("pair_address", ""),
+        "ts": int(time.time()),
+    }
+
+    with _top_signal_lock:
+        _top_signal_pool[addr] = row
+        # giới hạn bộ nhớ pool
+        if len(_top_signal_pool) > TOP_SIGNAL_MAX_CANDIDATES:
+            ranked = sorted(
+                _top_signal_pool.values(),
+                key=lambda x: (x.get("score", 0), x.get("liq", 0), -x.get("ts", 0)),
+                reverse=True,
+            )[:TOP_SIGNAL_MAX_CANDIDATES]
+            _top_signal_pool.clear()
+            for r in ranked:
+                _top_signal_pool[r["address"]] = r
+
+
+def _build_top_signal_message(rows: List[dict]) -> str:
+    top_n = max(1, int(TOP_SIGNAL_SIZE or 10))
+    rows = sorted(rows, key=lambda x: (x.get("score", 0), x.get("liq", 0), -x.get("ts", 0)), reverse=True)[:top_n]
+    now_txt = datetime.now().strftime("%H:%M:%S %d/%m")
+
+    lines = [
+        f"🏆 <b>TOP {len(rows)} TOKEN ĐIỂM CAO NHẤT</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🕒 {now_txt} | min score: <b>{SIGNAL_ALERT_MIN_SCORE}</b>",
+        "",
+    ]
+    for i, r in enumerate(rows, start=1):
+        sym = r.get("symbol", "?")
+        chain = r.get("chain", "solana")
+        ch = "SOL" if chain == "solana" else "BASE"
+        score = int(r.get("score", 0))
+        liq = _fmt_usd(float(r.get("liq", 0) or 0))
+        age = r.get("age", None)
+        age_txt = _age_str(age) if age is not None else "N/A"
+        addr = r.get("address", "")
+        pair = r.get("pair_address", "")
+        chart = f"https://dexscreener.com/{chain}/{pair}" if pair else ""
+
+        lines.append(
+            f"{i:02d}. <b>${sym}</b> [{ch}] — <b>{score}/100</b> | Liq <b>{liq}</b> | Age <b>{age_txt}</b>"
+        )
+        if addr:
+            lines.append(f"<code>{addr}</code>")
+        if chart:
+            lines.append(f"<a href='{chart}'>📉 Chart</a>")
+        lines.append("")
+
+    lines.append("#TopSignal #Scanner")
+    return "\n".join(lines)
+
+
+def maybe_send_top_signal_alert(force: bool = False):
+    """Gửi bảng top token định kỳ lên TELEGRAM_SIGNAL_CHANNELS."""
+    global _last_top_signal_sent_ts
+    if not TOP_SIGNAL_ENABLED:
+        return
+
+    now = time.time()
+    if not force and (now - _last_top_signal_sent_ts) < max(10, TOP_SIGNAL_INTERVAL_S):
+        return
+
+    with _top_signal_lock:
+        rows = list(_top_signal_pool.values())
+
+    if not rows:
+        return
+
+    msg = _build_top_signal_message(rows)
+    sent_ok = False
+    if TELEGRAM_SIGNAL_CHANNELS:
+        for cid in TELEGRAM_SIGNAL_CHANNELS:
+            sent_ok = _send_tg(msg, chat_id=cid) or sent_ok
+    else:
+        sent_ok = _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
+
+    if sent_ok:
+        _last_top_signal_sent_ts = now
+        print(f"[SignalTop] ✅ Đã gửi bảng top {min(len(rows), TOP_SIGNAL_SIZE)} token")
+    else:
+        print("[SignalTop] ⚠️  Gửi bảng top thất bại")
+
+
 def send_signal_alert(token: dict, score: int, detail: list):
     """
     Signal alert cho bạn bè: token đạt ≥ SIGNAL_ALERT_MIN_SCORE (mặc định 70).
@@ -4278,18 +4387,13 @@ def _validate_one(token: dict) -> Optional[dict]:
           f"Tuổi:{age_log} | Liq:{_fmt_usd(token['liquidity_usd'])} | "
           f"Top10:{top10_pct:.0f}% | Holders:{holder_count}")
 
-    # ── Signal Alert: gửi thông báo cho bạn bè nếu điểm đủ cao ────
-    # Chạy trong thread riêng để không chặn validator pipeline
+    # ── Signal Alert Top10: gom candidate và gửi bảng top định kỳ ───
     if score >= SIGNAL_ALERT_MIN_SCORE:
-        def _fire_signal(t=dict(token), s=score, d=list(detail)):
-            try:
-                send_signal_alert(t, s, d)
-            except Exception as _e:
-                print(f"[Signal] ⚠️  {_e}")
-        threading.Thread(
-            target=_fire_signal, daemon=True,
-            name=f"signal-{addr[:8]}"
-        ).start()
+        _update_top_signal_pool(token, score)
+        # force gửi ngay khi pool đạt đủ TOP_SIGNAL_SIZE để user luôn thấy tin nhắn
+        with _top_signal_lock:
+            pool_len = len(_top_signal_pool)
+        maybe_send_top_signal_alert(force=(pool_len >= max(1, TOP_SIGNAL_SIZE)))
 
     if score >= _min_score:
         return token
