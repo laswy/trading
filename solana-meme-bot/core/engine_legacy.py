@@ -321,12 +321,18 @@ SLIPPAGE_PCT          = float(os.getenv("SLIPPAGE_PCT",           "10"))
 SCAN_INTERVAL         = float(os.getenv("SCAN_INTERVAL_SECONDS",  "3"))
 TP_CHECK_INTERVAL     = float(os.getenv("TP_CHECK_INTERVAL_SECONDS", "5"))
 MIN_LIQUIDITY_USD     = float(os.getenv("MIN_LIQUIDITY_USD",      "5000"))
-MAX_AGE_MIN           = float(os.getenv("MAX_TOKEN_AGE_MINUTES",  "120"))
+MAX_AGE_MIN           = float(os.getenv("MAX_TOKEN_AGE_MINUTES",  "10080"))
 MIN_TOKEN_AGE_S       = float(os.getenv("MIN_TOKEN_AGE_S",        "90"))
 MIN_HOLDER_COUNT      = int(  os.getenv("MIN_HOLDER_COUNT",       "5"))
 MAX_TOP10_HOLDER_PCT  = float(os.getenv("MAX_TOP10_HOLDER_PCT",   "20"))
 VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", "2"))
 MIN_LP_SOL            = float(os.getenv("MIN_LP_SOL",             "5"))
+
+# ── Old-token momentum mode (focus token đã lâu, không phải meme mới) ──
+FOCUS_OLD_TOKENS         = str(os.getenv("FOCUS_OLD_TOKENS", "1")).strip().lower() in ("1", "true", "yes", "on")
+OLD_TOKEN_MIN_AGE_MIN    = float(os.getenv("OLD_TOKEN_MIN_AGE_MIN", "60"))
+OLD_TOKEN_MIN_TX_ACCEL   = float(os.getenv("OLD_TOKEN_MIN_TX_ACCEL", "1.8"))
+OLD_TOKEN_MIN_UPTREND_PCT = float(os.getenv("OLD_TOKEN_MIN_UPTREND_PCT", "6"))
 
 # ── Adaptive TP Check intervals (theo tuổi token) ─────────────────
 TP_CHECK_INTERVAL_NEW   = float(os.getenv("TP_CHECK_NEW_S",    "1"))   # token < 5p
@@ -1621,6 +1627,7 @@ def _log_score_snapshot(token: dict, score: int, min_score: int) -> None:
         "age_min": round(float(token.get("token_age_minutes") or 0), 2),
         "liq_usd": round(float(token.get("liquidity_usd") or 0), 2),
         "vol_1h": round(float(token.get("volume_1h") or 0), 2),
+        "stage": token.get("_score_stage", "validate"),
     }
 
     try:
@@ -2757,177 +2764,116 @@ def check_lp_status(addr: str) -> str:
 
 def calculate_score(t: dict) -> Tuple[int, list]:
     """
-    Scoring v4 — 5 nhóm tiêu chí (weight cao hơn cho early signals):
-      A. Liquidity quality      (max +20)
-      B. Momentum  m5/h1        (max +35)  ← tăng cap, thưởng mạnh hơn cho token < 5p
-      C. Buy acceleration       (max +20)  ← tăng weight, bắt sớm spike
-      D. Holder distribution    (max +20)  ← GoPlus data
-      E. Age zone               (max +20)  ← thưởng cao hơn cho token cực mới có momentum
-    Total max = 100. Penalty không giới hạn (có thể ra điểm âm → loại).
+    Scoring v5 (old-token momentum/trend):
+      A. Age focus (token lâu)         (max +25)
+      B. Trend rõ rệt                  (max +30)
+      C. Tx acceleration (m5 vs h1)    (max +25)
+      D. Liquidity + holder quality    (max +15)
+      E. Social validation             (max +10)
     """
     score, detail = 0, []
-    chain   = t.get("chain", "solana")
-    age     = t.get("token_age_minutes")
-    liq     = t.get("liquidity_usd", 0)
+    chain = t.get("chain", "solana")
+    age = t.get("token_age_minutes")
 
-    # ── A. LIQUIDITY QUALITY ────────────────────────────────────────
-    if liq >= 80_000:
-        score += 12; detail.append(f"💧 Liq ${liq/1000:.0f}K (deep): +12")
-    elif liq >= 30_000:
-        score += 20; detail.append(f"💧 Liq ${liq/1000:.0f}K (tốt): +20")
-    elif liq >= 10_000:
-        score += 14; detail.append(f"💧 Liq ${liq/1000:.0f}K: +14")
-    elif liq >= 5_000:
-        score += 6;  detail.append(f"💧 Liq ${liq/1000:.1f}K (mỏng): +6")
-    # < 3K đã bị hard reject ở _validate_one, không cần penalty ở đây
+    liq = float(t.get("liquidity_usd", 0) or 0)
+    vol_5m = float(t.get("volume_5m", 0) or 0)
+    vol_1h = float(t.get("volume_1h", 0) or 0)
+    vol_6h = float(t.get("volume_6h", 0) or 0)
 
-    # ── B. MOMENTUM — dùng khung thời gian phù hợp tuổi token ─────
-    # Token < 30p: dùng m5 + h1 | Token >= 30p: dùng h1 + h6
-    vol_m5   = t.get("volume_5m", 0)
-    vol_1h   = t.get("volume_1h", 0)
-    vol_6h   = t.get("volume_6h", 0)
-    buys_m5  = t.get("buys_5m", 0)
-    sells_m5 = t.get("sells_5m", 0)
-    buys_1h  = t.get("buys_1h", 0)
-    sells_1h = t.get("sells_1h", 0)
+    buys_5m = float(t.get("buys_5m", 0) or 0)
+    sells_5m = float(t.get("sells_5m", 0) or 0)
+    buys_1h = float(t.get("buys_1h", 0) or 0)
+    sells_1h = float(t.get("sells_1h", 0) or 0)
 
-    is_new = (age is not None and age < 30)
+    pc_1h = float(t.get("price_change_1h", 0) or 0)
+    pc_6h = float(t.get("price_change_6h", 0) or 0)
+    pc_24h = float(t.get("price_change_24h", 0) or 0)
 
-    if is_new:
-        # Dùng m5 + h1 cho token mới
-        ref_buys  = buys_m5  + buys_1h
-        ref_sells = sells_m5 + sells_m5
-        ref_vol   = vol_m5 * 12 + vol_1h   # annualize m5 để so sánh
-        window_label = "m5+h1"
-    else:
-        ref_buys  = buys_1h
-        ref_sells = sells_1h
-        ref_vol   = vol_1h
-        window_label = "h1"
-
-    # Vol/Liq ratio
-    if liq > 0 and ref_vol > 0:
-        vl = ref_vol / liq
-        if vl > 25:
-            score -= 15; detail.append(f"🚨 Vol/Liq={vl:.0f}x (wash trade?): -15")
-        elif vl >= 5:
-            # v4: token < 5p FOMO tốt hơn → +35
-            bonus = 35 if (age is not None and age < 5) else 30
-            score += bonus; detail.append(f"📊 Vol/Liq={vl:.1f}x [{window_label}] (FOMO): +{bonus}")
-        elif vl >= 2:
-            bonus = 27 if (age is not None and age < 5) else 22
-            score += bonus; detail.append(f"📊 Vol/Liq={vl:.1f}x [{window_label}]: +{bonus}")
-        elif vl >= 0.8:
-            score += 14; detail.append(f"📊 Vol/Liq={vl:.2f}x [{window_label}]: +14")
-        elif vl >= 0.3:
-            score += 6;  detail.append(f"📊 Vol/Liq={vl:.2f}x [{window_label}]: +6")
-
-    # Buy/Sell pressure
-    total_txns = ref_buys + ref_sells
-    bp = (ref_buys / total_txns * 100) if total_txns > 0 else 0
-    bs = ref_buys / max(ref_sells, 1)
-
-    if ref_sells > ref_buys * 2:
-        score -= 15; detail.append(f"🚨 Sells >> Buys [{window_label}] ({ref_sells}/{ref_buys}): -15")
-    elif bs >= 5:
-        score += 15; detail.append(f"🔥 B/S={bs:.1f}:1 [{window_label}]: +15")
-    elif bs >= 3:
-        score += 10; detail.append(f"🔥 B/S={bs:.1f}:1 [{window_label}]: +10")
-    elif bs >= 1.5:
-        score += 5;  detail.append(f"🔄 B/S={bs:.1f}:1 [{window_label}]: +5")
-    if bp >= 75:
-        score += 5; detail.append(f"💥 {bp:.0f}% là lệnh MUA: +5")
-
-    # ── C. BUY ACCELERATION — vol_m5 tăng nhanh so với h1 average ─
-    # v4: weight cao hơn để bắt spike sớm hơn
-    if vol_m5 > 0 and vol_1h > 0:
-        avg_m5_in_1h = vol_1h / 12   # trung bình mỗi 5 phút trong 1h
-        if avg_m5_in_1h > 0:
-            accel = vol_m5 / avg_m5_in_1h
-            if accel >= 5:
-                score += 20; detail.append(f"🚀 Vol 5p = {accel:.1f}x trung bình h1: +20")
-            elif accel >= 3:
-                score += 14; detail.append(f"📈 Vol 5p = {accel:.1f}x trung bình h1: +14")
-            elif accel >= 1.5:
-                score += 7;  detail.append(f"📈 Vol 5p = {accel:.1f}x trung bình h1: +7")
-            elif accel < 0.3 and vol_1h > 20_000:
-                score -= 8; detail.append(f"📉 Vol đang chết ({accel:.2f}x): -8")
-
-    # ── D. HOLDER DISTRIBUTION (từ GoPlus) ─────────────────────────
-    top10_pct   = t.get("top10_holder_pct", 0)
-    creator_pct = t.get("creator_pct", 0)
-    holders     = t.get("holder_count", 0)
-
-    if top10_pct > 0:
-        if top10_pct <= 20:
-            score += 20; detail.append(f"👥 Top10 chỉ {top10_pct:.0f}% (phân tán tốt): +20")
-        elif top10_pct <= 30:
-            score += 12; detail.append(f"👥 Top10={top10_pct:.0f}%: +12")
-        elif top10_pct <= 40:
-            score += 5;  detail.append(f"👥 Top10={top10_pct:.0f}% (chấp nhận): +5")
+    # A) Age focus: ưu tiên token đã lâu
+    if age is not None:
+        if age < OLD_TOKEN_MIN_AGE_MIN:
+            score -= 30; detail.append(f"🆕 Quá mới ({age:.0f}p): -30")
+        elif age <= 24 * 60:
+            score += 25; detail.append(f"⏳ Token lâu ({_age_str(age)}): +25")
+        elif age <= 7 * 24 * 60:
+            score += 18; detail.append(f"⏰ Token già ({_age_str(age)}): +18")
         else:
-            score -= 10; detail.append(f"⚠️  Top10={top10_pct:.0f}% (tập trung cao): -10")
-    # > 50% đã bị hard reject
+            score += 8; detail.append(f"📦 Token rất cũ ({_age_str(age)}): +8")
 
-    if creator_pct > 20:
-        score -= 10; detail.append(f"🚨 Creator giữ {creator_pct:.0f}%: -10")
-    elif creator_pct > 10:
-        score -= 5;  detail.append(f"⚠️  Creator giữ {creator_pct:.0f}%: -5")
+    # B) Uptrend rõ rệt (price trend)
+    trend_pts = 0
+    if pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT:
+        trend_pts += 14
+    elif pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT * 0.5:
+        trend_pts += 8
+    if pc_6h >= OLD_TOKEN_MIN_UPTREND_PCT * 1.5:
+        trend_pts += 10
+    elif pc_6h > 0:
+        trend_pts += 6
+    if pc_24h > 0:
+        trend_pts += 6
+    if trend_pts > 0:
+        score += min(30, trend_pts)
+        detail.append(f"📈 Trend 1h/6h/24h = {pc_1h:+.1f}/{pc_6h:+.1f}/{pc_24h:+.1f}%: +{min(30, trend_pts)}")
+    else:
+        score -= 8; detail.append("📉 Chưa có uptrend rõ: -8")
+
+    # C) Tx acceleration (5m so với baseline 1h)
+    buys_5m_base = max(1.0, buys_1h / 12.0)
+    tx_accel = buys_5m / buys_5m_base
+    bs_5m = buys_5m / max(sells_5m, 1.0)
+    if tx_accel >= OLD_TOKEN_MIN_TX_ACCEL * 2.0:
+        score += 25; detail.append(f"⚡ Tx accel x{tx_accel:.1f} (5m): +25")
+    elif tx_accel >= OLD_TOKEN_MIN_TX_ACCEL:
+        score += 18; detail.append(f"⚡ Tx accel x{tx_accel:.1f}: +18")
+    elif tx_accel >= 1.2:
+        score += 10; detail.append(f"⚡ Tx tăng nhẹ x{tx_accel:.1f}: +10")
+    else:
+        score -= 6; detail.append(f"🧊 Tx chưa tăng (x{tx_accel:.1f}): -6")
+
+    if bs_5m >= 2.0:
+        score += 7; detail.append(f"🟢 Buy pressure 5m {bs_5m:.1f}: +7")
+    elif bs_5m >= 1.2:
+        score += 4; detail.append(f"🟡 Buy pressure 5m {bs_5m:.1f}: +4")
+    else:
+        score -= 4; detail.append(f"🔴 Sell pressure 5m {bs_5m:.1f}: -4")
+
+    # D) Liquidity + holder quality
+    if liq >= 120_000:
+        score += 15; detail.append(f"💧 Liq sâu ${liq/1000:.0f}K: +15")
+    elif liq >= 50_000:
+        score += 12; detail.append(f"💧 Liq tốt ${liq/1000:.0f}K: +12")
+    elif liq >= 20_000:
+        score += 8; detail.append(f"💧 Liq ổn ${liq/1000:.0f}K: +8")
+    elif liq >= 5_000:
+        score += 3; detail.append(f"💧 Liq mỏng ${liq/1000:.1f}K: +3")
+
+    top10 = float(t.get("top10_holder_pct", 0) or 0)
+    holders = int(t.get("holder_count", 0) or 0)
+    if top10 <= 20:
+        score += 6; detail.append(f"👥 Top10 {top10:.0f}%: +6")
+    elif top10 <= 35:
+        score += 2; detail.append(f"👥 Top10 {top10:.0f}%: +2")
+    else:
+        score -= 6; detail.append(f"⚠️ Top10 cao {top10:.0f}%: -6")
 
     if holders >= 500:
-        score += 5; detail.append(f"👥 {holders} holders (cộng đồng rộng): +5")
+        score += 4; detail.append(f"👤 Holders {holders}: +4")
     elif holders >= 100:
-        score += 3; detail.append(f"👥 {holders} holders: +3")
-    elif 0 < holders < 30:
-        score -= 8; detail.append(f"⚠️  Chỉ {holders} holders: -8")
+        score += 2; detail.append(f"👤 Holders {holders}: +2")
 
-    # ── E. AGE ZONE ─────────────────────────────────────────────────
-    # v4: thưởng cao hơn cho token cực mới có momentum — bắt sớm hơn
-    if age is not None:
-        has_momentum = (ref_vol > 0 and liq > 0 and ref_vol / liq >= 0.5)
-        has_buyers   = bp >= 55
+    # Bonus theo volume trend (không phạt mạnh)
+    if vol_5m > 0 and vol_1h > 0:
+        v_acc = (vol_5m * 12) / max(vol_1h, 1.0)
+        if v_acc >= 1.5:
+            score += 5; detail.append(f"📊 Volume accel x{v_acc:.1f}: +5")
 
-        if age < 5:
-            if sells_m5 > 0:
-                score -= 10; detail.append(f"⚠️  {age:.1f}p + sells ngay ({sells_m5}): -10")
-            elif has_momentum and has_buyers:
-                # v4: token < 5p có momentum → thưởng mạnh (tín hiệu rất sớm)
-                score += 20; detail.append(f"🆕 {age:.1f}p + momentum + buyers: +20")
-            elif has_momentum:
-                score += 10; detail.append(f"🆕 {age:.1f}p + momentum: +10")
-        elif age <= 20:
-            if has_momentum and has_buyers:
-                score += 15; detail.append(f"🆕 {age:.0f}p + momentum tốt: +15")
-            elif has_momentum:
-                score += 8;  detail.append(f"⏰ {age:.0f}p + vol OK: +8")
-            else:
-                score += 2;  detail.append(f"⏰ {age:.0f}p (vol yếu): +2")
-        elif age <= 45:
-            score += 10; detail.append(f"⏰ {age:.0f}p: +10")
-        elif age <= 90:
-            score += 5;  detail.append(f"⏰ {age:.0f}p: +5")
-        else:
-            score -= 5;  detail.append(f"⏳ {age:.0f}p (>90p): -5")
-
-    # ── F. LP STATUS (Solana only) ──────────────────────────────────
-    lp = t.get("lp_status", "")
-    if chain == "solana":
-        if lp == "burned":
-            score += 15; detail.append("🔒 LP đốt 100%: +15")
-        elif lp == "locked":
-            score += 8;  detail.append("🔒 LP khóa: +8")
-        else:
-            score -= 8;  detail.append("⚠️  LP không rõ: -8")
-
-    # ── G. SOCIAL (validated) ────────────────────────────────────────
-    # validate_social_links() đã chạy trong _validate_one trước khi gọi calculate_score
-    # Chỉ cộng điểm nếu link được xác nhận hợp lệ
+    # E) Social (validated)
     website = t.get("website", "")
     twitter = t.get("twitter", "")
-    w_valid = t.get("website_valid", None)   # None = chưa validate
+    w_valid = t.get("website_valid", None)
     t_valid = t.get("twitter_valid", None)
 
-    # Nếu chưa validate (gọi trực tiếp không qua _validate_one) → fallback domain check
     if w_valid is None and website:
         try:
             from urllib.parse import urlparse
@@ -2939,14 +2885,24 @@ def calculate_score(t: dict) -> Tuple[int, list]:
         t_valid, _ = _validate_twitter(twitter)
 
     if w_valid:
-        score += 5; detail.append(f"🌐 Website verified: +5")
+        score += 5; detail.append("🌐 Website verified: +5")
     elif website and w_valid is False:
-        score -= 3; detail.append(f"⚠️  Fake/dead website: -3")
+        score -= 2; detail.append("⚠️ Fake/dead website: -2")
 
     if t_valid:
-        score += 5; detail.append(f"🐦 X/Twitter verified: +5")
+        score += 5; detail.append("🐦 X/Twitter verified: +5")
     elif twitter and t_valid is False:
-        score -= 3; detail.append(f"⚠️  Fake X account/search: -3")
+        score -= 2; detail.append("⚠️ Fake X account/search: -2")
+
+    # LP status cho Solana
+    lp = t.get("lp_status", "")
+    if chain == "solana":
+        if lp == "burned":
+            score += 8; detail.append("🔒 LP burned: +8")
+        elif lp == "locked":
+            score += 4; detail.append("🔒 LP locked: +4")
+        elif lp == "unknown":
+            score -= 3; detail.append("⚠️ LP unknown: -3")
 
     return max(0, min(score, 100)), detail
 
@@ -3000,34 +2956,96 @@ def _norm_dex(raw: str) -> str:
     return raw or "unknown"
 
 def _quick_score(pair: dict) -> int:
-    """Score nhanh từ raw pair object — không cần GoPlus."""
+    """Prefilter score cho scanner: ưu tiên token lâu + tăng tốc giao dịch + uptrend."""
     score = 0
     pcAt = pair.get("pairCreatedAt")
-    age  = ((time.time() - pcAt / 1000) / 60) if pcAt else None
+    age = ((time.time() - pcAt / 1000) / 60) if pcAt else None
+
+    # Age focus
     if age is not None:
-        if age < 3:           score += 20   # FIX: token cực mới không bị phạt
-        elif age <= 15:       score += 30
-        elif age <= 30:       score += 18
-        elif age <= 60:       score += 8
-        else:                 score -= 5
-    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
-    if 5_000 <= liq <= 40_000:    score += 20
-    elif 40_000 < liq <= 100_000: score += 15
-    elif liq > 100_000:           score += 10
-    vol1h = (pair.get("volume") or {}).get("h1", 0) or 0
-    if liq > 0:
-        if vol1h >= liq:          score += 25
-        elif vol1h >= liq * 0.5:  score += 18
-        elif vol1h >= 20_000:     score += 12
-        elif vol1h >= 10_000:     score += 6
-    txns  = pair.get("txns", {}) or {}
-    buys  = txns.get("h24", {}).get("buys", 0)
-    sells = txns.get("h24", {}).get("sells", 1)
-    ratio = buys / sells if sells > 0 else 0
-    if ratio >= 3.0:   score += 20
-    elif ratio >= 2.0: score += 15
-    elif ratio >= 1.5: score += 8
+        if age < OLD_TOKEN_MIN_AGE_MIN:
+            score -= 20
+        elif age <= 24 * 60:
+            score += 20
+        elif age <= 7 * 24 * 60:
+            score += 14
+        else:
+            score += 6
+
+    liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+    if liq >= 120_000:
+        score += 20
+    elif liq >= 50_000:
+        score += 14
+    elif liq >= 20_000:
+        score += 10
+    elif liq >= 5_000:
+        score += 4
+
+    vol = pair.get("volume") or {}
+    vol_5m = float(vol.get("m5", 0) or 0)
+    vol_1h = float(vol.get("h1", 0) or 0)
+    if vol_1h > 0:
+        v_acc = (vol_5m * 12) / vol_1h
+        if v_acc >= 1.8:
+            score += 15
+        elif v_acc >= 1.2:
+            score += 8
+
+    txns = pair.get("txns") or {}
+    buys_5m = float((txns.get("m5") or {}).get("buys", 0) or 0)
+    sells_5m = float((txns.get("m5") or {}).get("sells", 0) or 0)
+    buys_1h = float((txns.get("h1") or {}).get("buys", 0) or 0)
+    buys_5m_base = max(1.0, buys_1h / 12.0)
+    tx_acc = buys_5m / buys_5m_base
+    bs_5m = buys_5m / max(sells_5m, 1.0)
+    if tx_acc >= OLD_TOKEN_MIN_TX_ACCEL:
+        score += 18
+    elif tx_acc >= 1.2:
+        score += 8
+    if bs_5m >= 1.5:
+        score += 10
+
+    pc = pair.get("priceChange") or {}
+    pc_1h = float(pc.get("h1", 0) or 0)
+    pc_6h = float(pc.get("h6", 0) or 0)
+    if pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT:
+        score += 12
+    if pc_6h > 0:
+        score += 8
+
     return max(0, min(score, 100))
+
+
+def _scan_stage_score(token: dict) -> int:
+    """Điểm nhanh cho toàn bộ token scan được (ghi log score history)."""
+    s = 0
+    age = token.get("token_age_minutes")
+    liq = float(token.get("liquidity_usd", 0) or 0)
+    buys_5m = float(token.get("buys_5m", 0) or 0)
+    sells_5m = float(token.get("sells_5m", 0) or 0)
+    buys_1h = float(token.get("buys_1h", 0) or 0)
+    pc_1h = float(token.get("price_change_1h", 0) or 0)
+    pc_6h = float(token.get("price_change_6h", 0) or 0)
+
+    if age is not None:
+        if age >= OLD_TOKEN_MIN_AGE_MIN: s += 25
+        else: s -= 20
+    if liq >= 20000: s += 20
+    elif liq >= 5000: s += 10
+
+    b5_base = max(1.0, buys_1h/12.0)
+    acc = buys_5m / b5_base
+    if acc >= OLD_TOKEN_MIN_TX_ACCEL: s += 30
+    elif acc >= 1.2: s += 15
+
+    bs = buys_5m / max(sells_5m,1.0)
+    if bs >= 1.5: s += 10
+
+    if pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT: s += 10
+    if pc_6h > 0: s += 5
+
+    return max(0, min(100, int(s)))
 
 def _pair_to_token(pair: dict) -> Optional[dict]:
     """
@@ -3053,6 +3071,8 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
     pcAt    = pair.get("pairCreatedAt")
     age_min = ((time.time() - pcAt / 1000) / 60) if pcAt else None
     if age_min is not None and age_min > MAX_AGE_MIN:
+        return None
+    if FOCUS_OLD_TOKENS and age_min is not None and age_min < OLD_TOKEN_MIN_AGE_MIN:
         return None
     addr = (pair.get("baseToken") or {}).get("address", "")
     if not addr:
@@ -4164,6 +4184,11 @@ def scan_once() -> List[dict]:
                     seen_pair.add(pa)
                     pair = token.pop("_src_pair", {})
                     cands.append(token)
+                    # Lưu score cho TẤT CẢ token scan được (stage=scan)
+                    scan_score = _scan_stage_score(token)
+                    token["_scan_score"] = scan_score
+                    token["_score_stage"] = "scan"
+                    _log_score_snapshot(token, scan_score, int(cfg("MIN_SCORE") or MIN_SCORE))
                     # Early alert
                     if (token.get("token_age_minutes") is not None
                             and token["token_age_minutes"] <= EARLY_ALERT_MAX_AGE_MIN
@@ -4196,6 +4221,10 @@ def scan_once() -> List[dict]:
         if token:
             seen_pair.add(pa)
             cands.append(token)
+            scan_score = _scan_stage_score(token)
+            token["_scan_score"] = scan_score
+            token["_score_stage"] = "scan"
+            _log_score_snapshot(token, scan_score, int(cfg("MIN_SCORE") or MIN_SCORE))
             if (token.get("token_age_minutes") is not None
                     and token["token_age_minutes"] <= EARLY_ALERT_MAX_AGE_MIN
                     and token["address"] not in _early_alert_sent):
@@ -4335,12 +4364,30 @@ def _validate_one(token: dict) -> Optional[dict]:
         print(f"[Validator] 🚫 {sym}: Token age {age_min*60:.0f}s < {MIN_TOKEN_AGE_S:.0f}s")
         return None
 
-    # Volume spike filter: chỉ vào khi có đột biến vol ngắn hạn
+    # Old-token momentum gate: cần tăng tốc giao dịch HOẶC uptrend rõ
     vol_30s = float(token.get("volume_30s", 0) or 0)
     vol_5m_avg = float(token.get("volume_5m_avg", 0) or 0)
-    if vol_5m_avg <= 0 or vol_30s <= vol_5m_avg * VOLUME_SPIKE_MULTIPLIER:
-        print(f"[Validator] 🚫 {sym}: Volume spike chưa đạt ({vol_30s:.0f} <= {vol_5m_avg:.0f}×{VOLUME_SPIKE_MULTIPLIER:.1f})")
-        return None
+    buys_5m = float(token.get("buys_5m", 0) or 0)
+    buys_1h = float(token.get("buys_1h", 0) or 0)
+    pc_1h = float(token.get("price_change_1h", 0) or 0)
+    pc_6h = float(token.get("price_change_6h", 0) or 0)
+
+    tx_acc = buys_5m / max(1.0, buys_1h / 12.0)
+    vol_spike_ok = (vol_5m_avg > 0 and vol_30s > vol_5m_avg * VOLUME_SPIKE_MULTIPLIER)
+    tx_acc_ok = tx_acc >= OLD_TOKEN_MIN_TX_ACCEL
+    trend_ok = (pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT and pc_6h > 0)
+
+    if FOCUS_OLD_TOKENS:
+        if not (tx_acc_ok or trend_ok or vol_spike_ok):
+            print(
+                f"[Validator] 🚫 {sym}: thiếu tín hiệu tăng tốc/trend "
+                f"(tx_acc={tx_acc:.2f}, pc1h={pc_1h:+.1f}%, pc6h={pc_6h:+.1f}%)"
+            )
+            return None
+    else:
+        if not vol_spike_ok:
+            print(f"[Validator] 🚫 {sym}: Volume spike chưa đạt ({vol_30s:.0f} <= {vol_5m_avg:.0f}×{VOLUME_SPIKE_MULTIPLIER:.1f})")
+            return None
 
     # Liq hard floor — dùng MIN_LIQUIDITY_USD dynamic (min 3K tuyệt đối)
     liq_floor = max(3_000.0, cfg("MIN_LIQUIDITY_USD") or MIN_LIQUIDITY_USD)
@@ -4380,6 +4427,7 @@ def _validate_one(token: dict) -> Optional[dict]:
     token["_score_detail"] = detail
 
     _min_score = int(cfg("MIN_SCORE") or MIN_SCORE)
+    token["_score_stage"] = "validate"
     _log_score_snapshot(token, score, _min_score)
     age_log = f"{age_min:.0f}p" if age_min is not None else "N/A"
     flag = "✅" if score >= _min_score else "⏭ "
