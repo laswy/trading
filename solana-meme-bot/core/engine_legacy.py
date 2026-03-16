@@ -932,6 +932,14 @@ SIGNAL_ALERT_MIN_SCORE  = int(os.getenv("SIGNAL_ALERT_MIN_SCORE", "70"))   # ng�
 _signal_alert_sent: set = set()    # {mint} đã gửi signal trong session
 _signal_alert_lock      = threading.Lock()
 
+TOP_SIGNAL_ENABLED      = str(os.getenv("TOP_SIGNAL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+TOP_SIGNAL_SIZE         = int(os.getenv("TOP_SIGNAL_SIZE", "10"))
+TOP_SIGNAL_INTERVAL_S   = int(os.getenv("TOP_SIGNAL_INTERVAL_S", "90"))
+TOP_SIGNAL_MAX_CANDIDATES = int(os.getenv("TOP_SIGNAL_MAX_CANDIDATES", "200"))
+_top_signal_pool: Dict[str, dict] = {}   # {mint: {score, symbol, ...}}
+_top_signal_lock        = threading.Lock()
+_last_top_signal_sent_ts = 0.0
+
 # ================================================================
 # QUEUES
 # ================================================================
@@ -2962,6 +2970,26 @@ NEW_PAIRS_URLS = [
     "https://api.dexscreener.com/latest/dex/pairs/solana/new",
     "https://api.dexscreener.com/latest/dex/pairs/base/new",
 ]
+GECKO_NEW_POOL_URLS = [
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
+    "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=2",
+]
+
+REQUIRE_SOCIAL_WEB_X = str(os.getenv("REQUIRE_SOCIAL_WEB_X", "1")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
+BIRDEYE_TRENDING = str(os.getenv("BIRDEYE_TRENDING", "false")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
+BIRDEYE_NEW_LISTING = str(os.getenv("BIRDEYE_NEW_LISTING", "false")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
+BIRDEYE_CHAIN = os.getenv("BIRDEYE_CHAIN", "solana").strip().lower()
+BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
 def _extract_social(pair: dict, kind: str) -> str:
     """Lấy URL social từ DexScreener pair.info block."""
@@ -3053,6 +3081,16 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         return None
     vol  = pair.get("volume") or {}
     pc   = pair.get("priceChange") or {}
+    website = _extract_social(pair, "website")
+    twitter = _extract_social(pair, "twitter")
+
+    # Chỉ scan token có đủ website + X/Twitter thật (nếu bật REQUIRE_SOCIAL_WEB_X)
+    if REQUIRE_SOCIAL_WEB_X:
+        w_ok, _ = _validate_website(website) if website else (False, "missing")
+        t_ok, _ = _validate_twitter(twitter) if twitter else (False, "missing")
+        if not (w_ok and t_ok):
+            return None
+
     return {
         "address":          addr,
         "symbol":           (pair.get("baseToken") or {}).get("symbol", ""),
@@ -3085,8 +3123,8 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         "token_age_minutes": age_min,
         "lp_status":         "unknown",
         "chain":             chain_id,
-        "website":           _extract_social(pair, "website"),
-        "twitter":           _extract_social(pair, "twitter"),
+        "website":           website,
+        "twitter":           twitter,
         # GoPlus security data — sẽ được fill bởi _validate_one
         "goplus":            {},
     }
@@ -3174,6 +3212,182 @@ def fetch_new_pairs() -> List[dict]:
         except Exception as e:
             print(f"[Scan-B] ⚠️  {chain_label}: {e}")
     return result
+
+def _gecko_token_id_to_address(raw_id: str) -> str:
+    """Chuẩn hoá token id/address từ GeckoTerminal về địa chỉ thuần để query DexScreener."""
+    rid = str(raw_id or "").strip()
+    if not rid:
+        return ""
+
+    # Format thường gặp: "solana_<mint>" hoặc "base_0x..."
+    if "_" in rid:
+        _, tail = rid.split("_", 1)
+        rid = tail.strip()
+
+    # Gecko đôi lúc trả id dưới dạng path-like (vd: /tokens/<addr>)
+    if "/" in rid:
+        rid = rid.rsplit("/", 1)[-1].strip()
+
+    return rid
+
+
+def fetch_gecko_new_pool_addresses() -> List[str]:
+    """
+    Nguồn C: GeckoTerminal new_pools → token addresses.
+    Dùng để mở rộng discovery ngoài DexScreener profile/boost/new.
+    """
+    addrs: List[str] = []
+    seen: set = set()
+    for url in GECKO_NEW_POOL_URLS:
+        cache_key = f"gecko_new:{url.split('/networks/')[-1]}"
+        cached = _dex_cache.get(cache_key, ttl=20)
+        if cached is not None:
+            for addr in cached:
+                if addr not in seen:
+                    seen.add(addr)
+                    addrs.append(addr)
+            continue
+        try:
+            r = requests.get(
+                url,
+                timeout=10,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+            if r.status_code != 200:
+                print(f"[Scan-C] ⚠️  gecko status={r.status_code}: {url}")
+                continue
+
+            payload = r.json() if isinstance(r.json(), dict) else {}
+            items = payload.get("data") or []
+            included = payload.get("included") or []
+
+            # Map token id -> token address từ included (json:api)
+            included_token_addr: Dict[str, str] = {}
+            for inc in included:
+                inc_id = str(inc.get("id") or "")
+                inc_addr = _gecko_token_id_to_address((inc.get("attributes") or {}).get("address") or inc_id)
+                if inc_id and inc_addr:
+                    included_token_addr[inc_id] = inc_addr
+
+            batch: List[str] = []
+            for item in items:
+                attrs = item.get("attributes") or {}
+                rels = item.get("relationships") or {}
+
+                # Ưu tiên field address trực tiếp nếu API có
+                base_addr = _gecko_token_id_to_address(
+                    attrs.get("base_token_address")
+                    or attrs.get("token_address")
+                    or attrs.get("address")
+                    or ""
+                )
+
+                # Fallback 1: lấy từ relationships.base_token.data.id
+                base_token_id = ((rels.get("base_token") or {}).get("data") or {}).get("id") or ""
+                if not base_addr:
+                    base_addr = _gecko_token_id_to_address(base_token_id)
+
+                # Fallback 2: map token id -> included.attributes.address
+                if not base_addr and base_token_id:
+                    base_addr = included_token_addr.get(base_token_id, "")
+
+                if not base_addr:
+                    continue
+
+                batch.append(base_addr)
+                if base_addr not in seen:
+                    seen.add(base_addr)
+                    addrs.append(base_addr)
+
+            _dex_cache.set(cache_key, batch)
+            print(f"  [Scan-C] {url.split('/networks/')[-1]}: +{len(batch)} token")
+        except Exception as e:
+            print(f"[Scan-C] ⚠️  gecko new_pools: {e}")
+    return addrs
+
+def _birdeye_headers() -> Dict[str, str]:
+    h = {"accept": "application/json", "x-chain": BIRDEYE_CHAIN}
+    if BIRDEYE_API_KEY:
+        h["X-API-KEY"] = BIRDEYE_API_KEY
+    return h
+
+
+def _collect_addresses_from_obj(obj, out: set):
+    """Đệ quy nhặt các field có thể chứa token address trong payload Birdeye."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in (
+                "address", "token_address", "mint", "mint_address", "base_address",
+                "base_token", "base_token_address", "token0_address", "token1_address"
+            ) and isinstance(v, str):
+                vv = v.strip()
+                if vv:
+                    out.add(vv)
+            else:
+                _collect_addresses_from_obj(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_addresses_from_obj(item, out)
+
+
+def _fetch_birdeye_endpoint(url: str, label: str) -> List[str]:
+    cache_key = f"birdeye:{label}"
+    cached = _dex_cache.get(cache_key, ttl=20)
+    if cached is not None:
+        return cached
+
+    try:
+        r = requests.get(url, headers=_birdeye_headers(), timeout=10)
+        if r.status_code != 200:
+            print(f"[Scan-D] ⚠️  {label} status={r.status_code}")
+            return []
+        payload = r.json() if isinstance(r.json(), dict) else {}
+        data = payload.get("data", payload)
+        addrs: set = set()
+        _collect_addresses_from_obj(data, addrs)
+        result = [a for a in addrs if a]
+        _dex_cache.set(cache_key, result)
+        print(f"  [Scan-D] {label}: +{len(result)} token")
+        return result
+    except Exception as e:
+        print(f"[Scan-D] ⚠️  {label}: {e}")
+        return []
+
+
+def fetch_birdeye_addresses() -> List[str]:
+    """Nguồn D: Birdeye (trending/new listing) -> token addresses."""
+    if not (BIRDEYE_TRENDING or BIRDEYE_NEW_LISTING):
+        return []
+    if not BIRDEYE_API_KEY:
+        print("[Scan-D] ⚠️  BIRDEYE_API_KEY trống — bỏ qua nguồn Birdeye")
+        return []
+
+    # Nhiều endpoint dự phòng vì Birdeye thay đổi version path thường xuyên.
+    endpoints: List[Tuple[str, str]] = []
+    if BIRDEYE_TRENDING:
+        endpoints += [
+            (f"https://public-api.birdeye.so/defi/token_trending?sort_by=v24hUSD&sort_type=desc&limit={BIRDEYE_LIMIT}", "trending-v1"),
+            (f"https://public-api.birdeye.so/defi/v3/token/trending?limit={BIRDEYE_LIMIT}", "trending-v3"),
+        ]
+    if BIRDEYE_NEW_LISTING:
+        endpoints += [
+            (f"https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit={BIRDEYE_LIMIT}", "new-listing-v2"),
+            (f"https://public-api.birdeye.so/defi/v3/token/new_listing?limit={BIRDEYE_LIMIT}", "new-listing-v3"),
+        ]
+
+    addrs: List[str] = []
+    seen: set = set()
+    for url, label in endpoints:
+        for addr in _fetch_birdeye_endpoint(url, label):
+            if addr not in seen:
+                seen.add(addr)
+                addrs.append(addr)
+    return addrs
+
 
 def get_price_usd(addr: str, chain: str = "solana") -> float:
     """Lấy giá USD từ DexScreener. chain-aware: lọc đúng chainId."""
@@ -3441,6 +3655,107 @@ def send_early_alert(token: dict):
     )
     _send_tg(msg)
     print(f"[Scanner] ⚡ Early alert gửi: {sym} [{chain}] tuổi={age_str}")
+
+
+def _update_top_signal_pool(token: dict, score: int):
+    """Lưu candidate vào pool để gửi bảng xếp hạng top score lên group."""
+    if score < SIGNAL_ALERT_MIN_SCORE:
+        return
+    addr = token.get("address", "")
+    if not addr:
+        return
+
+    row = {
+        "address": addr,
+        "symbol": token.get("symbol", "?"),
+        "name": token.get("name", token.get("symbol", "?")),
+        "chain": token.get("chain", "solana"),
+        "score": int(score),
+        "liq": float(token.get("liquidity_usd", 0) or 0),
+        "age": token.get("token_age_minutes", None),
+        "pair_address": token.get("pair_address", ""),
+        "ts": int(time.time()),
+    }
+
+    with _top_signal_lock:
+        _top_signal_pool[addr] = row
+        # giới hạn bộ nhớ pool
+        if len(_top_signal_pool) > TOP_SIGNAL_MAX_CANDIDATES:
+            ranked = sorted(
+                _top_signal_pool.values(),
+                key=lambda x: (x.get("score", 0), x.get("liq", 0), -x.get("ts", 0)),
+                reverse=True,
+            )[:TOP_SIGNAL_MAX_CANDIDATES]
+            _top_signal_pool.clear()
+            for r in ranked:
+                _top_signal_pool[r["address"]] = r
+
+
+def _build_top_signal_message(rows: List[dict]) -> str:
+    top_n = max(1, int(TOP_SIGNAL_SIZE or 10))
+    rows = sorted(rows, key=lambda x: (x.get("score", 0), x.get("liq", 0), -x.get("ts", 0)), reverse=True)[:top_n]
+    now_txt = datetime.now().strftime("%H:%M:%S %d/%m")
+
+    lines = [
+        f"🏆 <b>TOP {len(rows)} TOKEN ĐIỂM CAO NHẤT</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🕒 {now_txt} | min score: <b>{SIGNAL_ALERT_MIN_SCORE}</b>",
+        "",
+    ]
+    for i, r in enumerate(rows, start=1):
+        sym = r.get("symbol", "?")
+        chain = r.get("chain", "solana")
+        ch = "SOL" if chain == "solana" else "BASE"
+        score = int(r.get("score", 0))
+        liq = _fmt_usd(float(r.get("liq", 0) or 0))
+        age = r.get("age", None)
+        age_txt = _age_str(age) if age is not None else "N/A"
+        addr = r.get("address", "")
+        pair = r.get("pair_address", "")
+        chart = f"https://dexscreener.com/{chain}/{pair}" if pair else ""
+
+        lines.append(
+            f"{i:02d}. <b>${sym}</b> [{ch}] — <b>{score}/100</b> | Liq <b>{liq}</b> | Age <b>{age_txt}</b>"
+        )
+        if addr:
+            lines.append(f"<code>{addr}</code>")
+        if chart:
+            lines.append(f"<a href='{chart}'>📉 Chart</a>")
+        lines.append("")
+
+    lines.append("#TopSignal #Scanner")
+    return "\n".join(lines)
+
+
+def maybe_send_top_signal_alert(force: bool = False):
+    """Gửi bảng top token định kỳ lên TELEGRAM_SIGNAL_CHANNELS."""
+    global _last_top_signal_sent_ts
+    if not TOP_SIGNAL_ENABLED:
+        return
+
+    now = time.time()
+    if not force and (now - _last_top_signal_sent_ts) < max(10, TOP_SIGNAL_INTERVAL_S):
+        return
+
+    with _top_signal_lock:
+        rows = list(_top_signal_pool.values())
+
+    if not rows:
+        return
+
+    msg = _build_top_signal_message(rows)
+    sent_ok = False
+    if TELEGRAM_SIGNAL_CHANNELS:
+        for cid in TELEGRAM_SIGNAL_CHANNELS:
+            sent_ok = _send_tg(msg, chat_id=cid) or sent_ok
+    else:
+        sent_ok = _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
+
+    if sent_ok:
+        _last_top_signal_sent_ts = now
+        print(f"[SignalTop] ✅ Đã gửi bảng top {min(len(rows), TOP_SIGNAL_SIZE)} token")
+    else:
+        print("[SignalTop] ⚠️  Gửi bảng top thất bại")
 
 
 def send_signal_alert(token: dict, score: int, detail: list):
@@ -3924,19 +4239,59 @@ def _fetch_pairs_for_addr(addr: str, now_ts: float) -> List[dict]:
 def scan_once() -> List[dict]:
     """
     Quét token song song:
-      Nguồn A: Profile/Boost → fetch tất cả địa chỉ SONG SONG (ThreadPool)
-      Nguồn B: /pairs/{chain}/new — chạy đồng thời với Nguồn A
+      Nguồn A: DexScreener Profile/Boost
+      Nguồn B: DexScreener /pairs/{chain}/new
+      Nguồn C: GeckoTerminal new_pools
+      Nguồn D: Birdeye trending/new listing (nếu bật)
     Tổng thời gian scan giảm từ ~30s xuống ~3-5s.
     """
     now_ts    = time.time()
     seen_pair: set = set()
     cands: List[dict] = []
 
-    # ── Nguồn A + B chạy đồng thời ───────────────────────────────
-    all_addrs = fetch_profile_addresses()
+    # ── Nguồn A + C + D chạy đồng thời ───────────────────────────
+    _profile_addrs_result: List[List[str]] = [[]]
+    _gecko_addrs_result: List[List[str]] = [[]]
+    _birdeye_addrs_result: List[List[str]] = [[]]
+
+    def _fetch_a():
+        _profile_addrs_result[0] = fetch_profile_addresses()
+
+    def _fetch_c():
+        _gecko_addrs_result[0] = fetch_gecko_new_pool_addresses()
+
+    def _fetch_d():
+        _birdeye_addrs_result[0] = fetch_birdeye_addresses()
+
+    a_thread = threading.Thread(target=_fetch_a, daemon=True)
+    c_thread = threading.Thread(target=_fetch_c, daemon=True)
+    d_thread = threading.Thread(target=_fetch_d, daemon=True)
+    a_thread.start()
+    c_thread.start()
+    d_thread.start()
+
+    a_thread.join(timeout=15)
+    c_thread.join(timeout=15)
+    d_thread.join(timeout=15)
+
+    all_addrs = []
+    seen_addr: set = set()
+    for addr in (
+        (_profile_addrs_result[0] or [])
+        + (_gecko_addrs_result[0] or [])
+        + (_birdeye_addrs_result[0] or [])
+    ):
+        if addr and addr not in seen_addr:
+            seen_addr.add(addr)
+            all_addrs.append(addr)
+
     sol_cnt   = sum(1 for a in all_addrs if len(a) > 42)
     base_cnt  = len(all_addrs) - sol_cnt
-    print(f"  [SCAN-A] {len(all_addrs)} địa chỉ (🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song")
+    print(
+        f"  [SCAN-A+C+D] {len(all_addrs)} địa chỉ "
+        f"(A:{len(_profile_addrs_result[0])} + C:{len(_gecko_addrs_result[0])} + D:{len(_birdeye_addrs_result[0])}) "
+        f"(🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song"
+    )
 
     # Nguồn B fetch trong thread riêng đồng thời với Nguồn A
     _new_pairs_result: List[list] = [[]]
@@ -4006,7 +4361,7 @@ def scan_once() -> List[dict]:
 
 
 def scanner_thread(stop_event: threading.Event):
-    print("[Scanner] 🟢 Bắt đầu scan (4 nguồn)...")
+    print("[Scanner] 🟢 Bắt đầu scan (đa nguồn: DexScreener + GeckoTerminal + Birdeye)...")
     in_queue: set = set()
     last_clear    = time.time()
 
@@ -4166,6 +4521,10 @@ def _validate_one(token: dict) -> Optional[dict]:
     # Chạy trước calculate_score để scoring dùng kết quả validated
     validate_social_links(token)
 
+    if REQUIRE_SOCIAL_WEB_X and not (token.get("website_valid") and token.get("twitter_valid")):
+        print(f"[Validator] 🚫 {sym}: thiếu Web/X hợp lệ")
+        return None
+
     # ── LỚP 2: Score cơ hội ──────────────────────────────────────
     score, detail = calculate_score(token)
     token["_opp_score"]    = score
@@ -4179,18 +4538,13 @@ def _validate_one(token: dict) -> Optional[dict]:
           f"Tuổi:{age_log} | Liq:{_fmt_usd(token['liquidity_usd'])} | "
           f"Top10:{top10_pct:.0f}% | Holders:{holder_count}")
 
-    # ── Signal Alert: gửi thông báo cho bạn bè nếu điểm đủ cao ────
-    # Chạy trong thread riêng để không chặn validator pipeline
+    # ── Signal Alert Top10: gom candidate và gửi bảng top định kỳ ───
     if score >= SIGNAL_ALERT_MIN_SCORE:
-        def _fire_signal(t=dict(token), s=score, d=list(detail)):
-            try:
-                send_signal_alert(t, s, d)
-            except Exception as _e:
-                print(f"[Signal] ⚠️  {_e}")
-        threading.Thread(
-            target=_fire_signal, daemon=True,
-            name=f"signal-{addr[:8]}"
-        ).start()
+        _update_top_signal_pool(token, score)
+        # force gửi ngay khi pool đạt đủ TOP_SIGNAL_SIZE để user luôn thấy tin nhắn
+        with _top_signal_lock:
+            pool_len = len(_top_signal_pool)
+        maybe_send_top_signal_alert(force=(pool_len >= max(1, TOP_SIGNAL_SIZE)))
 
     if score >= _min_score:
         return token
