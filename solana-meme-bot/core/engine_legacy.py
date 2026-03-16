@@ -321,12 +321,18 @@ SLIPPAGE_PCT          = float(os.getenv("SLIPPAGE_PCT",           "10"))
 SCAN_INTERVAL         = float(os.getenv("SCAN_INTERVAL_SECONDS",  "3"))
 TP_CHECK_INTERVAL     = float(os.getenv("TP_CHECK_INTERVAL_SECONDS", "5"))
 MIN_LIQUIDITY_USD     = float(os.getenv("MIN_LIQUIDITY_USD",      "5000"))
-MAX_AGE_MIN           = float(os.getenv("MAX_TOKEN_AGE_MINUTES",  "120"))
+MAX_AGE_MIN           = float(os.getenv("MAX_TOKEN_AGE_MINUTES",  "10080"))
 MIN_TOKEN_AGE_S       = float(os.getenv("MIN_TOKEN_AGE_S",        "90"))
 MIN_HOLDER_COUNT      = int(  os.getenv("MIN_HOLDER_COUNT",       "5"))
 MAX_TOP10_HOLDER_PCT  = float(os.getenv("MAX_TOP10_HOLDER_PCT",   "20"))
 VOLUME_SPIKE_MULTIPLIER = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", "2"))
 MIN_LP_SOL            = float(os.getenv("MIN_LP_SOL",             "5"))
+
+# ── Old-token momentum mode (focus token đã lâu, không phải meme mới) ──
+FOCUS_OLD_TOKENS         = str(os.getenv("FOCUS_OLD_TOKENS", "1")).strip().lower() in ("1", "true", "yes", "on")
+OLD_TOKEN_MIN_AGE_MIN    = float(os.getenv("OLD_TOKEN_MIN_AGE_MIN", "60"))
+OLD_TOKEN_MIN_TX_ACCEL   = float(os.getenv("OLD_TOKEN_MIN_TX_ACCEL", "1.8"))
+OLD_TOKEN_MIN_UPTREND_PCT = float(os.getenv("OLD_TOKEN_MIN_UPTREND_PCT", "6"))
 
 # ── Adaptive TP Check intervals (theo tuổi token) ─────────────────
 TP_CHECK_INTERVAL_NEW   = float(os.getenv("TP_CHECK_NEW_S",    "1"))   # token < 5p
@@ -931,6 +937,14 @@ _early_alert_lock       = threading.Lock()
 SIGNAL_ALERT_MIN_SCORE  = int(os.getenv("SIGNAL_ALERT_MIN_SCORE", "70"))   # ngưỡng điểm gửi signal
 _signal_alert_sent: set = set()    # {mint} đã gửi signal trong session
 _signal_alert_lock      = threading.Lock()
+
+TOP_SIGNAL_ENABLED      = str(os.getenv("TOP_SIGNAL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+TOP_SIGNAL_SIZE         = int(os.getenv("TOP_SIGNAL_SIZE", "10"))
+TOP_SIGNAL_INTERVAL_S   = int(os.getenv("TOP_SIGNAL_INTERVAL_S", "90"))
+TOP_SIGNAL_MAX_CANDIDATES = int(os.getenv("TOP_SIGNAL_MAX_CANDIDATES", "200"))
+_top_signal_pool: Dict[str, dict] = {}   # {mint: {score, symbol, ...}}
+_top_signal_lock        = threading.Lock()
+_last_top_signal_sent_ts = 0.0
 
 # ================================================================
 # QUEUES
@@ -1613,6 +1627,7 @@ def _log_score_snapshot(token: dict, score: int, min_score: int) -> None:
         "age_min": round(float(token.get("token_age_minutes") or 0), 2),
         "liq_usd": round(float(token.get("liquidity_usd") or 0), 2),
         "vol_1h": round(float(token.get("volume_1h") or 0), 2),
+        "stage": token.get("_score_stage", "validate"),
     }
 
     try:
@@ -2749,177 +2764,116 @@ def check_lp_status(addr: str) -> str:
 
 def calculate_score(t: dict) -> Tuple[int, list]:
     """
-    Scoring v4 — 5 nhóm tiêu chí (weight cao hơn cho early signals):
-      A. Liquidity quality      (max +20)
-      B. Momentum  m5/h1        (max +35)  ← tăng cap, thưởng mạnh hơn cho token < 5p
-      C. Buy acceleration       (max +20)  ← tăng weight, bắt sớm spike
-      D. Holder distribution    (max +20)  ← GoPlus data
-      E. Age zone               (max +20)  ← thưởng cao hơn cho token cực mới có momentum
-    Total max = 100. Penalty không giới hạn (có thể ra điểm âm → loại).
+    Scoring v5 (old-token momentum/trend):
+      A. Age focus (token lâu)         (max +25)
+      B. Trend rõ rệt                  (max +30)
+      C. Tx acceleration (m5 vs h1)    (max +25)
+      D. Liquidity + holder quality    (max +15)
+      E. Social validation             (max +10)
     """
     score, detail = 0, []
-    chain   = t.get("chain", "solana")
-    age     = t.get("token_age_minutes")
-    liq     = t.get("liquidity_usd", 0)
+    chain = t.get("chain", "solana")
+    age = t.get("token_age_minutes")
 
-    # ── A. LIQUIDITY QUALITY ────────────────────────────────────────
-    if liq >= 80_000:
-        score += 12; detail.append(f"💧 Liq ${liq/1000:.0f}K (deep): +12")
-    elif liq >= 30_000:
-        score += 20; detail.append(f"💧 Liq ${liq/1000:.0f}K (tốt): +20")
-    elif liq >= 10_000:
-        score += 14; detail.append(f"💧 Liq ${liq/1000:.0f}K: +14")
-    elif liq >= 5_000:
-        score += 6;  detail.append(f"💧 Liq ${liq/1000:.1f}K (mỏng): +6")
-    # < 3K đã bị hard reject ở _validate_one, không cần penalty ở đây
+    liq = float(t.get("liquidity_usd", 0) or 0)
+    vol_5m = float(t.get("volume_5m", 0) or 0)
+    vol_1h = float(t.get("volume_1h", 0) or 0)
+    vol_6h = float(t.get("volume_6h", 0) or 0)
 
-    # ── B. MOMENTUM — dùng khung thời gian phù hợp tuổi token ─────
-    # Token < 30p: dùng m5 + h1 | Token >= 30p: dùng h1 + h6
-    vol_m5   = t.get("volume_5m", 0)
-    vol_1h   = t.get("volume_1h", 0)
-    vol_6h   = t.get("volume_6h", 0)
-    buys_m5  = t.get("buys_5m", 0)
-    sells_m5 = t.get("sells_5m", 0)
-    buys_1h  = t.get("buys_1h", 0)
-    sells_1h = t.get("sells_1h", 0)
+    buys_5m = float(t.get("buys_5m", 0) or 0)
+    sells_5m = float(t.get("sells_5m", 0) or 0)
+    buys_1h = float(t.get("buys_1h", 0) or 0)
+    sells_1h = float(t.get("sells_1h", 0) or 0)
 
-    is_new = (age is not None and age < 30)
+    pc_1h = float(t.get("price_change_1h", 0) or 0)
+    pc_6h = float(t.get("price_change_6h", 0) or 0)
+    pc_24h = float(t.get("price_change_24h", 0) or 0)
 
-    if is_new:
-        # Dùng m5 + h1 cho token mới
-        ref_buys  = buys_m5  + buys_1h
-        ref_sells = sells_m5 + sells_m5
-        ref_vol   = vol_m5 * 12 + vol_1h   # annualize m5 để so sánh
-        window_label = "m5+h1"
-    else:
-        ref_buys  = buys_1h
-        ref_sells = sells_1h
-        ref_vol   = vol_1h
-        window_label = "h1"
-
-    # Vol/Liq ratio
-    if liq > 0 and ref_vol > 0:
-        vl = ref_vol / liq
-        if vl > 25:
-            score -= 15; detail.append(f"🚨 Vol/Liq={vl:.0f}x (wash trade?): -15")
-        elif vl >= 5:
-            # v4: token < 5p FOMO tốt hơn → +35
-            bonus = 35 if (age is not None and age < 5) else 30
-            score += bonus; detail.append(f"📊 Vol/Liq={vl:.1f}x [{window_label}] (FOMO): +{bonus}")
-        elif vl >= 2:
-            bonus = 27 if (age is not None and age < 5) else 22
-            score += bonus; detail.append(f"📊 Vol/Liq={vl:.1f}x [{window_label}]: +{bonus}")
-        elif vl >= 0.8:
-            score += 14; detail.append(f"📊 Vol/Liq={vl:.2f}x [{window_label}]: +14")
-        elif vl >= 0.3:
-            score += 6;  detail.append(f"📊 Vol/Liq={vl:.2f}x [{window_label}]: +6")
-
-    # Buy/Sell pressure
-    total_txns = ref_buys + ref_sells
-    bp = (ref_buys / total_txns * 100) if total_txns > 0 else 0
-    bs = ref_buys / max(ref_sells, 1)
-
-    if ref_sells > ref_buys * 2:
-        score -= 15; detail.append(f"🚨 Sells >> Buys [{window_label}] ({ref_sells}/{ref_buys}): -15")
-    elif bs >= 5:
-        score += 15; detail.append(f"🔥 B/S={bs:.1f}:1 [{window_label}]: +15")
-    elif bs >= 3:
-        score += 10; detail.append(f"🔥 B/S={bs:.1f}:1 [{window_label}]: +10")
-    elif bs >= 1.5:
-        score += 5;  detail.append(f"🔄 B/S={bs:.1f}:1 [{window_label}]: +5")
-    if bp >= 75:
-        score += 5; detail.append(f"💥 {bp:.0f}% là lệnh MUA: +5")
-
-    # ── C. BUY ACCELERATION — vol_m5 tăng nhanh so với h1 average ─
-    # v4: weight cao hơn để bắt spike sớm hơn
-    if vol_m5 > 0 and vol_1h > 0:
-        avg_m5_in_1h = vol_1h / 12   # trung bình mỗi 5 phút trong 1h
-        if avg_m5_in_1h > 0:
-            accel = vol_m5 / avg_m5_in_1h
-            if accel >= 5:
-                score += 20; detail.append(f"🚀 Vol 5p = {accel:.1f}x trung bình h1: +20")
-            elif accel >= 3:
-                score += 14; detail.append(f"📈 Vol 5p = {accel:.1f}x trung bình h1: +14")
-            elif accel >= 1.5:
-                score += 7;  detail.append(f"📈 Vol 5p = {accel:.1f}x trung bình h1: +7")
-            elif accel < 0.3 and vol_1h > 20_000:
-                score -= 8; detail.append(f"📉 Vol đang chết ({accel:.2f}x): -8")
-
-    # ── D. HOLDER DISTRIBUTION (từ GoPlus) ─────────────────────────
-    top10_pct   = t.get("top10_holder_pct", 0)
-    creator_pct = t.get("creator_pct", 0)
-    holders     = t.get("holder_count", 0)
-
-    if top10_pct > 0:
-        if top10_pct <= 20:
-            score += 20; detail.append(f"👥 Top10 chỉ {top10_pct:.0f}% (phân tán tốt): +20")
-        elif top10_pct <= 30:
-            score += 12; detail.append(f"👥 Top10={top10_pct:.0f}%: +12")
-        elif top10_pct <= 40:
-            score += 5;  detail.append(f"👥 Top10={top10_pct:.0f}% (chấp nhận): +5")
+    # A) Age focus: ưu tiên token đã lâu
+    if age is not None:
+        if age < OLD_TOKEN_MIN_AGE_MIN:
+            score -= 30; detail.append(f"🆕 Quá mới ({age:.0f}p): -30")
+        elif age <= 24 * 60:
+            score += 25; detail.append(f"⏳ Token lâu ({_age_str(age)}): +25")
+        elif age <= 7 * 24 * 60:
+            score += 18; detail.append(f"⏰ Token già ({_age_str(age)}): +18")
         else:
-            score -= 10; detail.append(f"⚠️  Top10={top10_pct:.0f}% (tập trung cao): -10")
-    # > 50% đã bị hard reject
+            score += 8; detail.append(f"📦 Token rất cũ ({_age_str(age)}): +8")
 
-    if creator_pct > 20:
-        score -= 10; detail.append(f"🚨 Creator giữ {creator_pct:.0f}%: -10")
-    elif creator_pct > 10:
-        score -= 5;  detail.append(f"⚠️  Creator giữ {creator_pct:.0f}%: -5")
+    # B) Uptrend rõ rệt (price trend)
+    trend_pts = 0
+    if pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT:
+        trend_pts += 14
+    elif pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT * 0.5:
+        trend_pts += 8
+    if pc_6h >= OLD_TOKEN_MIN_UPTREND_PCT * 1.5:
+        trend_pts += 10
+    elif pc_6h > 0:
+        trend_pts += 6
+    if pc_24h > 0:
+        trend_pts += 6
+    if trend_pts > 0:
+        score += min(30, trend_pts)
+        detail.append(f"📈 Trend 1h/6h/24h = {pc_1h:+.1f}/{pc_6h:+.1f}/{pc_24h:+.1f}%: +{min(30, trend_pts)}")
+    else:
+        score -= 8; detail.append("📉 Chưa có uptrend rõ: -8")
+
+    # C) Tx acceleration (5m so với baseline 1h)
+    buys_5m_base = max(1.0, buys_1h / 12.0)
+    tx_accel = buys_5m / buys_5m_base
+    bs_5m = buys_5m / max(sells_5m, 1.0)
+    if tx_accel >= OLD_TOKEN_MIN_TX_ACCEL * 2.0:
+        score += 25; detail.append(f"⚡ Tx accel x{tx_accel:.1f} (5m): +25")
+    elif tx_accel >= OLD_TOKEN_MIN_TX_ACCEL:
+        score += 18; detail.append(f"⚡ Tx accel x{tx_accel:.1f}: +18")
+    elif tx_accel >= 1.2:
+        score += 10; detail.append(f"⚡ Tx tăng nhẹ x{tx_accel:.1f}: +10")
+    else:
+        score -= 6; detail.append(f"🧊 Tx chưa tăng (x{tx_accel:.1f}): -6")
+
+    if bs_5m >= 2.0:
+        score += 7; detail.append(f"🟢 Buy pressure 5m {bs_5m:.1f}: +7")
+    elif bs_5m >= 1.2:
+        score += 4; detail.append(f"🟡 Buy pressure 5m {bs_5m:.1f}: +4")
+    else:
+        score -= 4; detail.append(f"🔴 Sell pressure 5m {bs_5m:.1f}: -4")
+
+    # D) Liquidity + holder quality
+    if liq >= 120_000:
+        score += 15; detail.append(f"💧 Liq sâu ${liq/1000:.0f}K: +15")
+    elif liq >= 50_000:
+        score += 12; detail.append(f"💧 Liq tốt ${liq/1000:.0f}K: +12")
+    elif liq >= 20_000:
+        score += 8; detail.append(f"💧 Liq ổn ${liq/1000:.0f}K: +8")
+    elif liq >= 5_000:
+        score += 3; detail.append(f"💧 Liq mỏng ${liq/1000:.1f}K: +3")
+
+    top10 = float(t.get("top10_holder_pct", 0) or 0)
+    holders = int(t.get("holder_count", 0) or 0)
+    if top10 <= 20:
+        score += 6; detail.append(f"👥 Top10 {top10:.0f}%: +6")
+    elif top10 <= 35:
+        score += 2; detail.append(f"👥 Top10 {top10:.0f}%: +2")
+    else:
+        score -= 6; detail.append(f"⚠️ Top10 cao {top10:.0f}%: -6")
 
     if holders >= 500:
-        score += 5; detail.append(f"👥 {holders} holders (cộng đồng rộng): +5")
+        score += 4; detail.append(f"👤 Holders {holders}: +4")
     elif holders >= 100:
-        score += 3; detail.append(f"👥 {holders} holders: +3")
-    elif 0 < holders < 30:
-        score -= 8; detail.append(f"⚠️  Chỉ {holders} holders: -8")
+        score += 2; detail.append(f"👤 Holders {holders}: +2")
 
-    # ── E. AGE ZONE ─────────────────────────────────────────────────
-    # v4: thưởng cao hơn cho token cực mới có momentum — bắt sớm hơn
-    if age is not None:
-        has_momentum = (ref_vol > 0 and liq > 0 and ref_vol / liq >= 0.5)
-        has_buyers   = bp >= 55
+    # Bonus theo volume trend (không phạt mạnh)
+    if vol_5m > 0 and vol_1h > 0:
+        v_acc = (vol_5m * 12) / max(vol_1h, 1.0)
+        if v_acc >= 1.5:
+            score += 5; detail.append(f"📊 Volume accel x{v_acc:.1f}: +5")
 
-        if age < 5:
-            if sells_m5 > 0:
-                score -= 10; detail.append(f"⚠️  {age:.1f}p + sells ngay ({sells_m5}): -10")
-            elif has_momentum and has_buyers:
-                # v4: token < 5p có momentum → thưởng mạnh (tín hiệu rất sớm)
-                score += 20; detail.append(f"🆕 {age:.1f}p + momentum + buyers: +20")
-            elif has_momentum:
-                score += 10; detail.append(f"🆕 {age:.1f}p + momentum: +10")
-        elif age <= 20:
-            if has_momentum and has_buyers:
-                score += 15; detail.append(f"🆕 {age:.0f}p + momentum tốt: +15")
-            elif has_momentum:
-                score += 8;  detail.append(f"⏰ {age:.0f}p + vol OK: +8")
-            else:
-                score += 2;  detail.append(f"⏰ {age:.0f}p (vol yếu): +2")
-        elif age <= 45:
-            score += 10; detail.append(f"⏰ {age:.0f}p: +10")
-        elif age <= 90:
-            score += 5;  detail.append(f"⏰ {age:.0f}p: +5")
-        else:
-            score -= 5;  detail.append(f"⏳ {age:.0f}p (>90p): -5")
-
-    # ── F. LP STATUS (Solana only) ──────────────────────────────────
-    lp = t.get("lp_status", "")
-    if chain == "solana":
-        if lp == "burned":
-            score += 15; detail.append("🔒 LP đốt 100%: +15")
-        elif lp == "locked":
-            score += 8;  detail.append("🔒 LP khóa: +8")
-        else:
-            score -= 8;  detail.append("⚠️  LP không rõ: -8")
-
-    # ── G. SOCIAL (validated) ────────────────────────────────────────
-    # validate_social_links() đã chạy trong _validate_one trước khi gọi calculate_score
-    # Chỉ cộng điểm nếu link được xác nhận hợp lệ
+    # E) Social (validated)
     website = t.get("website", "")
     twitter = t.get("twitter", "")
-    w_valid = t.get("website_valid", None)   # None = chưa validate
+    w_valid = t.get("website_valid", None)
     t_valid = t.get("twitter_valid", None)
 
-    # Nếu chưa validate (gọi trực tiếp không qua _validate_one) → fallback domain check
     if w_valid is None and website:
         try:
             from urllib.parse import urlparse
@@ -2931,14 +2885,24 @@ def calculate_score(t: dict) -> Tuple[int, list]:
         t_valid, _ = _validate_twitter(twitter)
 
     if w_valid:
-        score += 5; detail.append(f"🌐 Website verified: +5")
+        score += 5; detail.append("🌐 Website verified: +5")
     elif website and w_valid is False:
-        score -= 3; detail.append(f"⚠️  Fake/dead website: -3")
+        score -= 2; detail.append("⚠️ Fake/dead website: -2")
 
     if t_valid:
-        score += 5; detail.append(f"🐦 X/Twitter verified: +5")
+        score += 5; detail.append("🐦 X/Twitter verified: +5")
     elif twitter and t_valid is False:
-        score -= 3; detail.append(f"⚠️  Fake X account/search: -3")
+        score -= 2; detail.append("⚠️ Fake X account/search: -2")
+
+    # LP status cho Solana
+    lp = t.get("lp_status", "")
+    if chain == "solana":
+        if lp == "burned":
+            score += 8; detail.append("🔒 LP burned: +8")
+        elif lp == "locked":
+            score += 4; detail.append("🔒 LP locked: +4")
+        elif lp == "unknown":
+            score -= 3; detail.append("⚠️ LP unknown: -3")
 
     return max(0, min(score, 100)), detail
 
@@ -2962,6 +2926,26 @@ NEW_PAIRS_URLS = [
     "https://api.dexscreener.com/latest/dex/pairs/solana/new",
     "https://api.dexscreener.com/latest/dex/pairs/base/new",
 ]
+GECKO_NEW_POOL_URLS = [
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
+    "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=2",
+]
+
+REQUIRE_SOCIAL_WEB_X = str(os.getenv("REQUIRE_SOCIAL_WEB_X", "1")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
+BIRDEYE_TRENDING = str(os.getenv("BIRDEYE_TRENDING", "false")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
+BIRDEYE_NEW_LISTING = str(os.getenv("BIRDEYE_NEW_LISTING", "false")).strip().lower() in (
+    "1", "true", "yes", "on"
+)
+BIRDEYE_CHAIN = os.getenv("BIRDEYE_CHAIN", "solana").strip().lower()
+BIRDEYE_LIMIT = int(os.getenv("BIRDEYE_LIMIT", "50"))
 
 def _extract_social(pair: dict, kind: str) -> str:
     """Lấy URL social từ DexScreener pair.info block."""
@@ -2982,34 +2966,96 @@ def _norm_dex(raw: str) -> str:
     return raw or "unknown"
 
 def _quick_score(pair: dict) -> int:
-    """Score nhanh từ raw pair object — không cần GoPlus."""
+    """Prefilter score cho scanner: ưu tiên token lâu + tăng tốc giao dịch + uptrend."""
     score = 0
     pcAt = pair.get("pairCreatedAt")
-    age  = ((time.time() - pcAt / 1000) / 60) if pcAt else None
+    age = ((time.time() - pcAt / 1000) / 60) if pcAt else None
+
+    # Age focus
     if age is not None:
-        if age < 3:           score += 20   # FIX: token cực mới không bị phạt
-        elif age <= 15:       score += 30
-        elif age <= 30:       score += 18
-        elif age <= 60:       score += 8
-        else:                 score -= 5
-    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
-    if 5_000 <= liq <= 40_000:    score += 20
-    elif 40_000 < liq <= 100_000: score += 15
-    elif liq > 100_000:           score += 10
-    vol1h = (pair.get("volume") or {}).get("h1", 0) or 0
-    if liq > 0:
-        if vol1h >= liq:          score += 25
-        elif vol1h >= liq * 0.5:  score += 18
-        elif vol1h >= 20_000:     score += 12
-        elif vol1h >= 10_000:     score += 6
-    txns  = pair.get("txns", {}) or {}
-    buys  = txns.get("h24", {}).get("buys", 0)
-    sells = txns.get("h24", {}).get("sells", 1)
-    ratio = buys / sells if sells > 0 else 0
-    if ratio >= 3.0:   score += 20
-    elif ratio >= 2.0: score += 15
-    elif ratio >= 1.5: score += 8
+        if age < OLD_TOKEN_MIN_AGE_MIN:
+            score -= 20
+        elif age <= 24 * 60:
+            score += 20
+        elif age <= 7 * 24 * 60:
+            score += 14
+        else:
+            score += 6
+
+    liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+    if liq >= 120_000:
+        score += 20
+    elif liq >= 50_000:
+        score += 14
+    elif liq >= 20_000:
+        score += 10
+    elif liq >= 5_000:
+        score += 4
+
+    vol = pair.get("volume") or {}
+    vol_5m = float(vol.get("m5", 0) or 0)
+    vol_1h = float(vol.get("h1", 0) or 0)
+    if vol_1h > 0:
+        v_acc = (vol_5m * 12) / vol_1h
+        if v_acc >= 1.8:
+            score += 15
+        elif v_acc >= 1.2:
+            score += 8
+
+    txns = pair.get("txns") or {}
+    buys_5m = float((txns.get("m5") or {}).get("buys", 0) or 0)
+    sells_5m = float((txns.get("m5") or {}).get("sells", 0) or 0)
+    buys_1h = float((txns.get("h1") or {}).get("buys", 0) or 0)
+    buys_5m_base = max(1.0, buys_1h / 12.0)
+    tx_acc = buys_5m / buys_5m_base
+    bs_5m = buys_5m / max(sells_5m, 1.0)
+    if tx_acc >= OLD_TOKEN_MIN_TX_ACCEL:
+        score += 18
+    elif tx_acc >= 1.2:
+        score += 8
+    if bs_5m >= 1.5:
+        score += 10
+
+    pc = pair.get("priceChange") or {}
+    pc_1h = float(pc.get("h1", 0) or 0)
+    pc_6h = float(pc.get("h6", 0) or 0)
+    if pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT:
+        score += 12
+    if pc_6h > 0:
+        score += 8
+
     return max(0, min(score, 100))
+
+
+def _scan_stage_score(token: dict) -> int:
+    """Điểm nhanh cho toàn bộ token scan được (ghi log score history)."""
+    s = 0
+    age = token.get("token_age_minutes")
+    liq = float(token.get("liquidity_usd", 0) or 0)
+    buys_5m = float(token.get("buys_5m", 0) or 0)
+    sells_5m = float(token.get("sells_5m", 0) or 0)
+    buys_1h = float(token.get("buys_1h", 0) or 0)
+    pc_1h = float(token.get("price_change_1h", 0) or 0)
+    pc_6h = float(token.get("price_change_6h", 0) or 0)
+
+    if age is not None:
+        if age >= OLD_TOKEN_MIN_AGE_MIN: s += 25
+        else: s -= 20
+    if liq >= 20000: s += 20
+    elif liq >= 5000: s += 10
+
+    b5_base = max(1.0, buys_1h/12.0)
+    acc = buys_5m / b5_base
+    if acc >= OLD_TOKEN_MIN_TX_ACCEL: s += 30
+    elif acc >= 1.2: s += 15
+
+    bs = buys_5m / max(sells_5m,1.0)
+    if bs >= 1.5: s += 10
+
+    if pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT: s += 10
+    if pc_6h > 0: s += 5
+
+    return max(0, min(100, int(s)))
 
 def _pair_to_token(pair: dict) -> Optional[dict]:
     """
@@ -3036,6 +3082,8 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
     age_min = ((time.time() - pcAt / 1000) / 60) if pcAt else None
     if age_min is not None and age_min > MAX_AGE_MIN:
         return None
+    if FOCUS_OLD_TOKENS and age_min is not None and age_min < OLD_TOKEN_MIN_AGE_MIN:
+        return None
     addr = (pair.get("baseToken") or {}).get("address", "")
     if not addr:
         return None
@@ -3053,6 +3101,16 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         return None
     vol  = pair.get("volume") or {}
     pc   = pair.get("priceChange") or {}
+    website = _extract_social(pair, "website")
+    twitter = _extract_social(pair, "twitter")
+
+    # Chỉ scan token có đủ website + X/Twitter thật (nếu bật REQUIRE_SOCIAL_WEB_X)
+    if REQUIRE_SOCIAL_WEB_X:
+        w_ok, _ = _validate_website(website) if website else (False, "missing")
+        t_ok, _ = _validate_twitter(twitter) if twitter else (False, "missing")
+        if not (w_ok and t_ok):
+            return None
+
     return {
         "address":          addr,
         "symbol":           (pair.get("baseToken") or {}).get("symbol", ""),
@@ -3085,8 +3143,8 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
         "token_age_minutes": age_min,
         "lp_status":         "unknown",
         "chain":             chain_id,
-        "website":           _extract_social(pair, "website"),
-        "twitter":           _extract_social(pair, "twitter"),
+        "website":           website,
+        "twitter":           twitter,
         # GoPlus security data — sẽ được fill bởi _validate_one
         "goplus":            {},
     }
@@ -3174,6 +3232,182 @@ def fetch_new_pairs() -> List[dict]:
         except Exception as e:
             print(f"[Scan-B] ⚠️  {chain_label}: {e}")
     return result
+
+def _gecko_token_id_to_address(raw_id: str) -> str:
+    """Chuẩn hoá token id/address từ GeckoTerminal về địa chỉ thuần để query DexScreener."""
+    rid = str(raw_id or "").strip()
+    if not rid:
+        return ""
+
+    # Format thường gặp: "solana_<mint>" hoặc "base_0x..."
+    if "_" in rid:
+        _, tail = rid.split("_", 1)
+        rid = tail.strip()
+
+    # Gecko đôi lúc trả id dưới dạng path-like (vd: /tokens/<addr>)
+    if "/" in rid:
+        rid = rid.rsplit("/", 1)[-1].strip()
+
+    return rid
+
+
+def fetch_gecko_new_pool_addresses() -> List[str]:
+    """
+    Nguồn C: GeckoTerminal new_pools → token addresses.
+    Dùng để mở rộng discovery ngoài DexScreener profile/boost/new.
+    """
+    addrs: List[str] = []
+    seen: set = set()
+    for url in GECKO_NEW_POOL_URLS:
+        cache_key = f"gecko_new:{url.split('/networks/')[-1]}"
+        cached = _dex_cache.get(cache_key, ttl=20)
+        if cached is not None:
+            for addr in cached:
+                if addr not in seen:
+                    seen.add(addr)
+                    addrs.append(addr)
+            continue
+        try:
+            r = requests.get(
+                url,
+                timeout=10,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+            if r.status_code != 200:
+                print(f"[Scan-C] ⚠️  gecko status={r.status_code}: {url}")
+                continue
+
+            payload = r.json() if isinstance(r.json(), dict) else {}
+            items = payload.get("data") or []
+            included = payload.get("included") or []
+
+            # Map token id -> token address từ included (json:api)
+            included_token_addr: Dict[str, str] = {}
+            for inc in included:
+                inc_id = str(inc.get("id") or "")
+                inc_addr = _gecko_token_id_to_address((inc.get("attributes") or {}).get("address") or inc_id)
+                if inc_id and inc_addr:
+                    included_token_addr[inc_id] = inc_addr
+
+            batch: List[str] = []
+            for item in items:
+                attrs = item.get("attributes") or {}
+                rels = item.get("relationships") or {}
+
+                # Ưu tiên field address trực tiếp nếu API có
+                base_addr = _gecko_token_id_to_address(
+                    attrs.get("base_token_address")
+                    or attrs.get("token_address")
+                    or attrs.get("address")
+                    or ""
+                )
+
+                # Fallback 1: lấy từ relationships.base_token.data.id
+                base_token_id = ((rels.get("base_token") or {}).get("data") or {}).get("id") or ""
+                if not base_addr:
+                    base_addr = _gecko_token_id_to_address(base_token_id)
+
+                # Fallback 2: map token id -> included.attributes.address
+                if not base_addr and base_token_id:
+                    base_addr = included_token_addr.get(base_token_id, "")
+
+                if not base_addr:
+                    continue
+
+                batch.append(base_addr)
+                if base_addr not in seen:
+                    seen.add(base_addr)
+                    addrs.append(base_addr)
+
+            _dex_cache.set(cache_key, batch)
+            print(f"  [Scan-C] {url.split('/networks/')[-1]}: +{len(batch)} token")
+        except Exception as e:
+            print(f"[Scan-C] ⚠️  gecko new_pools: {e}")
+    return addrs
+
+def _birdeye_headers() -> Dict[str, str]:
+    h = {"accept": "application/json", "x-chain": BIRDEYE_CHAIN}
+    if BIRDEYE_API_KEY:
+        h["X-API-KEY"] = BIRDEYE_API_KEY
+    return h
+
+
+def _collect_addresses_from_obj(obj, out: set):
+    """Đệ quy nhặt các field có thể chứa token address trong payload Birdeye."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in (
+                "address", "token_address", "mint", "mint_address", "base_address",
+                "base_token", "base_token_address", "token0_address", "token1_address"
+            ) and isinstance(v, str):
+                vv = v.strip()
+                if vv:
+                    out.add(vv)
+            else:
+                _collect_addresses_from_obj(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_addresses_from_obj(item, out)
+
+
+def _fetch_birdeye_endpoint(url: str, label: str) -> List[str]:
+    cache_key = f"birdeye:{label}"
+    cached = _dex_cache.get(cache_key, ttl=20)
+    if cached is not None:
+        return cached
+
+    try:
+        r = requests.get(url, headers=_birdeye_headers(), timeout=10)
+        if r.status_code != 200:
+            print(f"[Scan-D] ⚠️  {label} status={r.status_code}")
+            return []
+        payload = r.json() if isinstance(r.json(), dict) else {}
+        data = payload.get("data", payload)
+        addrs: set = set()
+        _collect_addresses_from_obj(data, addrs)
+        result = [a for a in addrs if a]
+        _dex_cache.set(cache_key, result)
+        print(f"  [Scan-D] {label}: +{len(result)} token")
+        return result
+    except Exception as e:
+        print(f"[Scan-D] ⚠️  {label}: {e}")
+        return []
+
+
+def fetch_birdeye_addresses() -> List[str]:
+    """Nguồn D: Birdeye (trending/new listing) -> token addresses."""
+    if not (BIRDEYE_TRENDING or BIRDEYE_NEW_LISTING):
+        return []
+    if not BIRDEYE_API_KEY:
+        print("[Scan-D] ⚠️  BIRDEYE_API_KEY trống — bỏ qua nguồn Birdeye")
+        return []
+
+    # Nhiều endpoint dự phòng vì Birdeye thay đổi version path thường xuyên.
+    endpoints: List[Tuple[str, str]] = []
+    if BIRDEYE_TRENDING:
+        endpoints += [
+            (f"https://public-api.birdeye.so/defi/token_trending?sort_by=v24hUSD&sort_type=desc&limit={BIRDEYE_LIMIT}", "trending-v1"),
+            (f"https://public-api.birdeye.so/defi/v3/token/trending?limit={BIRDEYE_LIMIT}", "trending-v3"),
+        ]
+    if BIRDEYE_NEW_LISTING:
+        endpoints += [
+            (f"https://public-api.birdeye.so/defi/v2/tokens/new_listing?limit={BIRDEYE_LIMIT}", "new-listing-v2"),
+            (f"https://public-api.birdeye.so/defi/v3/token/new_listing?limit={BIRDEYE_LIMIT}", "new-listing-v3"),
+        ]
+
+    addrs: List[str] = []
+    seen: set = set()
+    for url, label in endpoints:
+        for addr in _fetch_birdeye_endpoint(url, label):
+            if addr not in seen:
+                seen.add(addr)
+                addrs.append(addr)
+    return addrs
+
 
 def get_price_usd(addr: str, chain: str = "solana") -> float:
     """Lấy giá USD từ DexScreener. chain-aware: lọc đúng chainId."""
@@ -3441,6 +3675,107 @@ def send_early_alert(token: dict):
     )
     _send_tg(msg)
     print(f"[Scanner] ⚡ Early alert gửi: {sym} [{chain}] tuổi={age_str}")
+
+
+def _update_top_signal_pool(token: dict, score: int):
+    """Lưu candidate vào pool để gửi bảng xếp hạng top score lên group."""
+    if score < SIGNAL_ALERT_MIN_SCORE:
+        return
+    addr = token.get("address", "")
+    if not addr:
+        return
+
+    row = {
+        "address": addr,
+        "symbol": token.get("symbol", "?"),
+        "name": token.get("name", token.get("symbol", "?")),
+        "chain": token.get("chain", "solana"),
+        "score": int(score),
+        "liq": float(token.get("liquidity_usd", 0) or 0),
+        "age": token.get("token_age_minutes", None),
+        "pair_address": token.get("pair_address", ""),
+        "ts": int(time.time()),
+    }
+
+    with _top_signal_lock:
+        _top_signal_pool[addr] = row
+        # giới hạn bộ nhớ pool
+        if len(_top_signal_pool) > TOP_SIGNAL_MAX_CANDIDATES:
+            ranked = sorted(
+                _top_signal_pool.values(),
+                key=lambda x: (x.get("score", 0), x.get("liq", 0), -x.get("ts", 0)),
+                reverse=True,
+            )[:TOP_SIGNAL_MAX_CANDIDATES]
+            _top_signal_pool.clear()
+            for r in ranked:
+                _top_signal_pool[r["address"]] = r
+
+
+def _build_top_signal_message(rows: List[dict]) -> str:
+    top_n = max(1, int(TOP_SIGNAL_SIZE or 10))
+    rows = sorted(rows, key=lambda x: (x.get("score", 0), x.get("liq", 0), -x.get("ts", 0)), reverse=True)[:top_n]
+    now_txt = datetime.now().strftime("%H:%M:%S %d/%m")
+
+    lines = [
+        f"🏆 <b>TOP {len(rows)} TOKEN ĐIỂM CAO NHẤT</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🕒 {now_txt} | min score: <b>{SIGNAL_ALERT_MIN_SCORE}</b>",
+        "",
+    ]
+    for i, r in enumerate(rows, start=1):
+        sym = r.get("symbol", "?")
+        chain = r.get("chain", "solana")
+        ch = "SOL" if chain == "solana" else "BASE"
+        score = int(r.get("score", 0))
+        liq = _fmt_usd(float(r.get("liq", 0) or 0))
+        age = r.get("age", None)
+        age_txt = _age_str(age) if age is not None else "N/A"
+        addr = r.get("address", "")
+        pair = r.get("pair_address", "")
+        chart = f"https://dexscreener.com/{chain}/{pair}" if pair else ""
+
+        lines.append(
+            f"{i:02d}. <b>${sym}</b> [{ch}] — <b>{score}/100</b> | Liq <b>{liq}</b> | Age <b>{age_txt}</b>"
+        )
+        if addr:
+            lines.append(f"<code>{addr}</code>")
+        if chart:
+            lines.append(f"<a href='{chart}'>📉 Chart</a>")
+        lines.append("")
+
+    lines.append("#TopSignal #Scanner")
+    return "\n".join(lines)
+
+
+def maybe_send_top_signal_alert(force: bool = False):
+    """Gửi bảng top token định kỳ lên TELEGRAM_SIGNAL_CHANNELS."""
+    global _last_top_signal_sent_ts
+    if not TOP_SIGNAL_ENABLED:
+        return
+
+    now = time.time()
+    if not force and (now - _last_top_signal_sent_ts) < max(10, TOP_SIGNAL_INTERVAL_S):
+        return
+
+    with _top_signal_lock:
+        rows = list(_top_signal_pool.values())
+
+    if not rows:
+        return
+
+    msg = _build_top_signal_message(rows)
+    sent_ok = False
+    if TELEGRAM_SIGNAL_CHANNELS:
+        for cid in TELEGRAM_SIGNAL_CHANNELS:
+            sent_ok = _send_tg(msg, chat_id=cid) or sent_ok
+    else:
+        sent_ok = _send_tg(msg, chat_id=TELEGRAM_CHAT_ID)
+
+    if sent_ok:
+        _last_top_signal_sent_ts = now
+        print(f"[SignalTop] ✅ Đã gửi bảng top {min(len(rows), TOP_SIGNAL_SIZE)} token")
+    else:
+        print("[SignalTop] ⚠️  Gửi bảng top thất bại")
 
 
 def send_signal_alert(token: dict, score: int, detail: list):
@@ -3924,19 +4259,59 @@ def _fetch_pairs_for_addr(addr: str, now_ts: float) -> List[dict]:
 def scan_once() -> List[dict]:
     """
     Quét token song song:
-      Nguồn A: Profile/Boost → fetch tất cả địa chỉ SONG SONG (ThreadPool)
-      Nguồn B: /pairs/{chain}/new — chạy đồng thời với Nguồn A
+      Nguồn A: DexScreener Profile/Boost
+      Nguồn B: DexScreener /pairs/{chain}/new
+      Nguồn C: GeckoTerminal new_pools
+      Nguồn D: Birdeye trending/new listing (nếu bật)
     Tổng thời gian scan giảm từ ~30s xuống ~3-5s.
     """
     now_ts    = time.time()
     seen_pair: set = set()
     cands: List[dict] = []
 
-    # ── Nguồn A + B chạy đồng thời ───────────────────────────────
-    all_addrs = fetch_profile_addresses()
+    # ── Nguồn A + C + D chạy đồng thời ───────────────────────────
+    _profile_addrs_result: List[List[str]] = [[]]
+    _gecko_addrs_result: List[List[str]] = [[]]
+    _birdeye_addrs_result: List[List[str]] = [[]]
+
+    def _fetch_a():
+        _profile_addrs_result[0] = fetch_profile_addresses()
+
+    def _fetch_c():
+        _gecko_addrs_result[0] = fetch_gecko_new_pool_addresses()
+
+    def _fetch_d():
+        _birdeye_addrs_result[0] = fetch_birdeye_addresses()
+
+    a_thread = threading.Thread(target=_fetch_a, daemon=True)
+    c_thread = threading.Thread(target=_fetch_c, daemon=True)
+    d_thread = threading.Thread(target=_fetch_d, daemon=True)
+    a_thread.start()
+    c_thread.start()
+    d_thread.start()
+
+    a_thread.join(timeout=15)
+    c_thread.join(timeout=15)
+    d_thread.join(timeout=15)
+
+    all_addrs = []
+    seen_addr: set = set()
+    for addr in (
+        (_profile_addrs_result[0] or [])
+        + (_gecko_addrs_result[0] or [])
+        + (_birdeye_addrs_result[0] or [])
+    ):
+        if addr and addr not in seen_addr:
+            seen_addr.add(addr)
+            all_addrs.append(addr)
+
     sol_cnt   = sum(1 for a in all_addrs if len(a) > 42)
     base_cnt  = len(all_addrs) - sol_cnt
-    print(f"  [SCAN-A] {len(all_addrs)} địa chỉ (🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song")
+    print(
+        f"  [SCAN-A+C+D] {len(all_addrs)} địa chỉ "
+        f"(A:{len(_profile_addrs_result[0])} + C:{len(_gecko_addrs_result[0])} + D:{len(_birdeye_addrs_result[0])}) "
+        f"(🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song"
+    )
 
     # Nguồn B fetch trong thread riêng đồng thời với Nguồn A
     _new_pairs_result: List[list] = [[]]
@@ -3960,6 +4335,11 @@ def scan_once() -> List[dict]:
                     seen_pair.add(pa)
                     pair = token.pop("_src_pair", {})
                     cands.append(token)
+                    # Lưu score cho TẤT CẢ token scan được (stage=scan)
+                    scan_score = _scan_stage_score(token)
+                    token["_scan_score"] = scan_score
+                    token["_score_stage"] = "scan"
+                    _log_score_snapshot(token, scan_score, int(cfg("MIN_SCORE") or MIN_SCORE))
                     # Early alert
                     if (token.get("token_age_minutes") is not None
                             and token["token_age_minutes"] <= EARLY_ALERT_MAX_AGE_MIN
@@ -3992,6 +4372,10 @@ def scan_once() -> List[dict]:
         if token:
             seen_pair.add(pa)
             cands.append(token)
+            scan_score = _scan_stage_score(token)
+            token["_scan_score"] = scan_score
+            token["_score_stage"] = "scan"
+            _log_score_snapshot(token, scan_score, int(cfg("MIN_SCORE") or MIN_SCORE))
             if (token.get("token_age_minutes") is not None
                     and token["token_age_minutes"] <= EARLY_ALERT_MAX_AGE_MIN
                     and token["address"] not in _early_alert_sent):
@@ -4006,7 +4390,7 @@ def scan_once() -> List[dict]:
 
 
 def scanner_thread(stop_event: threading.Event):
-    print("[Scanner] 🟢 Bắt đầu scan (4 nguồn)...")
+    print("[Scanner] 🟢 Bắt đầu scan (đa nguồn: DexScreener + GeckoTerminal + Birdeye)...")
     in_queue: set = set()
     last_clear    = time.time()
 
@@ -4131,12 +4515,30 @@ def _validate_one(token: dict) -> Optional[dict]:
         print(f"[Validator] 🚫 {sym}: Token age {age_min*60:.0f}s < {MIN_TOKEN_AGE_S:.0f}s")
         return None
 
-    # Volume spike filter: chỉ vào khi có đột biến vol ngắn hạn
+    # Old-token momentum gate: cần tăng tốc giao dịch HOẶC uptrend rõ
     vol_30s = float(token.get("volume_30s", 0) or 0)
     vol_5m_avg = float(token.get("volume_5m_avg", 0) or 0)
-    if vol_5m_avg <= 0 or vol_30s <= vol_5m_avg * VOLUME_SPIKE_MULTIPLIER:
-        print(f"[Validator] 🚫 {sym}: Volume spike chưa đạt ({vol_30s:.0f} <= {vol_5m_avg:.0f}×{VOLUME_SPIKE_MULTIPLIER:.1f})")
-        return None
+    buys_5m = float(token.get("buys_5m", 0) or 0)
+    buys_1h = float(token.get("buys_1h", 0) or 0)
+    pc_1h = float(token.get("price_change_1h", 0) or 0)
+    pc_6h = float(token.get("price_change_6h", 0) or 0)
+
+    tx_acc = buys_5m / max(1.0, buys_1h / 12.0)
+    vol_spike_ok = (vol_5m_avg > 0 and vol_30s > vol_5m_avg * VOLUME_SPIKE_MULTIPLIER)
+    tx_acc_ok = tx_acc >= OLD_TOKEN_MIN_TX_ACCEL
+    trend_ok = (pc_1h >= OLD_TOKEN_MIN_UPTREND_PCT and pc_6h > 0)
+
+    if FOCUS_OLD_TOKENS:
+        if not (tx_acc_ok or trend_ok or vol_spike_ok):
+            print(
+                f"[Validator] 🚫 {sym}: thiếu tín hiệu tăng tốc/trend "
+                f"(tx_acc={tx_acc:.2f}, pc1h={pc_1h:+.1f}%, pc6h={pc_6h:+.1f}%)"
+            )
+            return None
+    else:
+        if not vol_spike_ok:
+            print(f"[Validator] 🚫 {sym}: Volume spike chưa đạt ({vol_30s:.0f} <= {vol_5m_avg:.0f}×{VOLUME_SPIKE_MULTIPLIER:.1f})")
+            return None
 
     # Liq hard floor — dùng MIN_LIQUIDITY_USD dynamic (min 3K tuyệt đối)
     liq_floor = max(3_000.0, cfg("MIN_LIQUIDITY_USD") or MIN_LIQUIDITY_USD)
@@ -4166,12 +4568,17 @@ def _validate_one(token: dict) -> Optional[dict]:
     # Chạy trước calculate_score để scoring dùng kết quả validated
     validate_social_links(token)
 
+    if REQUIRE_SOCIAL_WEB_X and not (token.get("website_valid") and token.get("twitter_valid")):
+        print(f"[Validator] 🚫 {sym}: thiếu Web/X hợp lệ")
+        return None
+
     # ── LỚP 2: Score cơ hội ──────────────────────────────────────
     score, detail = calculate_score(token)
     token["_opp_score"]    = score
     token["_score_detail"] = detail
 
     _min_score = int(cfg("MIN_SCORE") or MIN_SCORE)
+    token["_score_stage"] = "validate"
     _log_score_snapshot(token, score, _min_score)
     age_log = f"{age_min:.0f}p" if age_min is not None else "N/A"
     flag = "✅" if score >= _min_score else "⏭ "
@@ -4179,18 +4586,13 @@ def _validate_one(token: dict) -> Optional[dict]:
           f"Tuổi:{age_log} | Liq:{_fmt_usd(token['liquidity_usd'])} | "
           f"Top10:{top10_pct:.0f}% | Holders:{holder_count}")
 
-    # ── Signal Alert: gửi thông báo cho bạn bè nếu điểm đủ cao ────
-    # Chạy trong thread riêng để không chặn validator pipeline
+    # ── Signal Alert Top10: gom candidate và gửi bảng top định kỳ ───
     if score >= SIGNAL_ALERT_MIN_SCORE:
-        def _fire_signal(t=dict(token), s=score, d=list(detail)):
-            try:
-                send_signal_alert(t, s, d)
-            except Exception as _e:
-                print(f"[Signal] ⚠️  {_e}")
-        threading.Thread(
-            target=_fire_signal, daemon=True,
-            name=f"signal-{addr[:8]}"
-        ).start()
+        _update_top_signal_pool(token, score)
+        # force gửi ngay khi pool đạt đủ TOP_SIGNAL_SIZE để user luôn thấy tin nhắn
+        with _top_signal_lock:
+            pool_len = len(_top_signal_pool)
+        maybe_send_top_signal_alert(force=(pool_len >= max(1, TOP_SIGNAL_SIZE)))
 
     if score >= _min_score:
         return token
