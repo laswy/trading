@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lộ trình đào tạo ISO 14001:2015 cho môi trường nhà máy</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #4b5563;
+      --accent: #0f766e;
+      --danger: #b91c1c;
+      --danger-bg: #fff1f2;
+      --border: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--text); }
+    .container { max-width: 1200px; margin: 0 auto; padding: 16px; display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+    .sidebar { padding: 14px; position: sticky; top: 12px; height: fit-content; }
+    .sidebar h1 { margin: 0 0 8px; font-size: 1.15rem; }
+    .sidebar p { color: var(--muted); margin: 0 0 10px; }
+    .sidebar ul { margin: 0; padding-left: 18px; }
+    .sidebar a { color: var(--accent); text-decoration: none; }
+    .sidebar a:hover, .sidebar a:focus { text-decoration: underline; }
+    .content { padding: 16px; }
+    .day-section + .day-section { margin-top: 16px; }
+    .day-header { margin: 0 0 10px; padding-bottom: 8px; border-bottom: 2px solid #e5e7eb; }
+    .day-subtitle { margin: 0; color: var(--muted); }
+    .module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; }
+    .module-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: #fcfdff; }
+    .module-card h3 { margin: 0 0 8px; font-size: 1rem; }
+    .module-card p { margin: 0 0 8px; color: var(--muted); }
+    .module-card a { color: var(--accent); font-weight: 700; }
+    .major-note { margin-top: 16px; padding: 10px; border-left: 5px solid var(--danger); background: var(--danger-bg); border-radius: 6px; }
+    .major-note h2 { margin: 0 0 6px; color: var(--danger); font-size: 1rem; }
+    .improve { margin-top: 16px; }
+    .improve h2 { margin-top: 0; }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } .sidebar { position: static; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <aside class="panel sidebar" aria-label="Điều hướng chương trình">
+      <h1>Đào tạo ISO 14001:2015</h1>
+      <p>Ngữ cảnh: môi trường nhà máy thực tế, trọng tâm năng lực đánh giá và nhận diện không phù hợp nghiêm trọng.</p>
+      <ul>
+        <li><a href="#day1">Ngày 1: Nhận thức & Nền tảng hệ thống</a></li>
+        <li><a href="#day2">Ngày 2: Nhận diện & Hoạch định</a></li>
+        <li><a href="#day3">Ngày 3: Vận hành – Audit – Đối ứng</a></li>
+      </ul>
+    </aside>
+
+    <main class="panel content">
+      <section id="day1" class="day-section" aria-labelledby="day1-title">
+        <h2 id="day1-title" class="day-header">Ngày 1 — Nhận thức & Nền tảng hệ thống</h2>
+        <p class="day-subtitle">Tổng quan ISO 14001, cấu trúc điều khoản 4–10, thuật ngữ cốt lõi.</p>
+        <div class="module-grid">
+          <article class="module-card"><h3>M1: Tổng quan</h3><p>PDCA, bối cảnh nhà máy, vai trò lãnh đạo.</p><a href="modules/m1_tong_quan_iso14001.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M2: Điều khoản</h3><p>Liên kết điều khoản 4–10 theo chuỗi giá trị.</p><a href="modules/m2_dieu_khoan_4_10.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M3: Thuật ngữ</h3><p>Khía cạnh môi trường, tác động môi trường, nghĩa vụ tuân thủ, không phù hợp, hành động khắc phục.</p><a href="modules/m3_thuat_ngu_cot_loi.html">Mở mô-đun</a></article>
+        </div>
+      </section>
+
+      <section id="day2" class="day-section" aria-labelledby="day2-title">
+        <h2 id="day2-title" class="day-header">Ngày 2 — Nhận diện & Hoạch định (trọng tâm kỹ thuật)</h2>
+        <p class="day-subtitle">Xác định khía cạnh, đánh giá tác động, pháp lý, rủi ro và cơ hội.</p>
+        <div class="module-grid">
+          <article class="module-card"><h3>M4: Khía cạnh</h3><p>Nhận diện khía cạnh theo điều kiện thường/bất thường/khẩn cấp.</p><a href="modules/m4_nhan_dien_aspect.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M5: Tác động</h3><p>Định lượng mức độ tác động và ưu tiên kiểm soát.</p><a href="modules/m5_danh_gia_impact.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M6: Tuân thủ</h3><p>Danh mục pháp lý, bằng chứng tuân thủ, tần suất đánh giá.</p><a href="modules/m6_tuan_thu_phap_ly.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M7: Rủi ro</h3><p>Rủi ro/cơ hội gắn mục tiêu và nguồn lực.</p><a href="modules/m7_risk_opportunity.html">Mở mô-đun</a></article>
+        </div>
+      </section>
+
+      <section id="day3" class="day-section" aria-labelledby="day3-title">
+        <h2 id="day3-title" class="day-header">Ngày 3 — Vận hành – Đánh giá – Đối ứng</h2>
+        <p class="day-subtitle">Kiểm soát vận hành, khẩn cấp, hồ sơ, đánh giá nội bộ, không phù hợp và đối ứng.</p>
+        <div class="module-grid">
+          <article class="module-card"><h3>M8: Kiểm soát vận hành</h3><a href="modules/m8_kiem_soat_van_hanh.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M9: Khẩn cấp</h3><a href="modules/m9_ung_pho_khan_cap.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M10: Hồ sơ</h3><a href="modules/m10_kiem_soat_ho_so.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M11: Đánh giá nội bộ</h3><a href="modules/m11_audit_noi_bo.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M12: Không phù hợp & khắc phục</h3><a href="modules/m12_xu_ly_nc.html">Mở mô-đun</a></article>
+          <article class="module-card"><h3>M13: Đối ứng</h3><a href="modules/m13_doi_ung_co_quan_ben_lien_quan.html">Mở mô-đun</a></article>
+        </div>
+      </section>
+
+      <section class="major-note" aria-label="Nhắc nhở không phù hợp nghiêm trọng">
+        <h2>Điểm nhấn bắt buộc cho học viên đánh giá</h2>
+        <p>Với mọi mô-đun, học viên phải trả lời được: bằng chứng nào chứng minh hệ thống đang kiểm soát rủi ro môi trường thực tế? Nếu không có bằng chứng khách quan hoặc vi phạm pháp lý lặp lại, cần nâng mức đánh giá lên nguy cơ <strong>không phù hợp nghiêm trọng</strong>.</p>
+      </section>
+
+      <section class="improve" aria-labelledby="goi-y-title">
+        <h2 id="goi-y-title">Gợi ý cải tiến thêm</h2>
+        <ul>
+          <li>Thêm bộ bài tập đóng vai tình huống theo từng vai trò: quản đốc, EHS, bảo trì, kho hóa chất.</li>
+          <li>Tích hợp thang tiêu chí chấm điểm năng lực đánh giá (lấy mẫu, truy vết, kết luận, đề xuất khắc phục và phòng ngừa).</li>
+          <li>Thêm checklist đánh giá nhanh tại hiện trường (5–7 phút) cho ca đêm.</li>
+          <li>Gắn KPI đào tạo: tỷ lệ phát hiện NC đúng mức độ và tỷ lệ khắc phục và phòng ngừa hiệu lực sau 60 ngày.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
