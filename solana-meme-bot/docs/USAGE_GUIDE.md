@@ -30,6 +30,22 @@ Các biến bắt buộc tối thiểu:
 
 Bộ tham số memecoin baseline đã có sẵn trong `.env.example` (score, entry windows, TP/trailing, volume spike, LP, token age).
 
+### 2a) Chế độ NOTIFY-ONLY vs AUTO-BUY
+
+Mặc định (`AUTO_BUY_ENABLED=0`): bot **không tự mua/bán**. Khi 1 token đạt
+`MIN_OPPORTUNITY_SCORE` và qua EntryGuard, bot gửi thông báo Telegram
+"🔔 CƠ HỘI MUA" kèm điểm số, giá, mức mua gợi ý, và buy-links (OKX Web3,
+Jupiter, Bitget, Binance Web3, DexScreener...) để bạn tự vào lệnh bằng ví
+của chính bạn. Bot không ký/gửi bất kỳ transaction nào, không lưu position,
+không tự chốt lời/cắt lỗ.
+
+Muốn quay lại chế độ tự động mua + quản lý TP/rug/trailing-stop như trước:
+đặt `AUTO_BUY_ENABLED=1` trong `.env`.
+
+Log khởi động (`python main.py`) in rõ đang chạy chế độ nào (`🔔 CHẾ ĐỘ
+NOTIFY-ONLY` hoặc banner auto-trade đầy đủ), và lệnh Telegram `/status` luôn
+hiển thị mode hiện tại ở đầu.
+
 ### 2b) Bật thêm chain: BNB / Ethereum / Robinhood Chain (tùy chọn)
 
 Bot mặc định trade Solana (Jupiter) + Base (OKX aggregator). Có thể bật thêm
@@ -73,8 +89,8 @@ Bot sẽ:
 - scan token mới,
 - validate theo security + quality filters,
 - chấm điểm cơ hội,
-- tự vào lệnh khi đủ điều kiện,
-- quản lý thoát lệnh theo TP/trailing/risk.
+- **mặc định (`AUTO_BUY_ENABLED=0`)**: gửi thông báo Telegram kèm buy-links để bạn tự vào lệnh — xem mục 2a,
+- **nếu `AUTO_BUY_ENABLED=1`**: tự vào lệnh khi đủ điều kiện và quản lý thoát lệnh theo TP/trailing/risk.
 
 ## 4) Đổi nhanh cấu hình bằng profile
 
@@ -131,8 +147,9 @@ Gợi ý vận hành:
 
 ## 7) Troubleshooting nhanh
 
-- **Bot không vào lệnh**: kiểm tra `MIN_OPPORTUNITY_SCORE`, volume spike filter, token age filter quá chặt.
-- **Vào lệnh ít**: giảm nhẹ `MIN_OPPORTUNITY_SCORE` hoặc `VOLUME_SPIKE_MULTIPLIER`.
+- **Bot không gửi thông báo / không vào lệnh**: kiểm tra `MIN_OPPORTUNITY_SCORE`, volume spike filter, token age filter quá chặt.
+- **Thông báo/vào lệnh ít**: giảm nhẹ `MIN_OPPORTUNITY_SCORE` hoặc `VOLUME_SPIKE_MULTIPLIER`.
+- **Muốn bot tự mua thay vì chỉ thông báo**: set `AUTO_BUY_ENABLED=1` trong `.env` — xem mục 2a.
 - **Chốt lời quá sớm**: tăng `TP2_PCT` hoặc nới `TRAILING_STOP_PCT`.
 - **Rủi ro cao**: tăng `MIN_HOLDER_COUNT`, giảm `MAX_TOP10_HOLDER_PCT`, tăng `MIN_TOKEN_AGE_S`.
 - **Chain BNB/ETH/Robinhood không hoạt động**: xem log khởi động — bot in rõ `DISABLED (thiếu: ...)` cho từng chain. Điền đủ biến còn thiếu trong `.env` (mục 2b) rồi khởi động lại.

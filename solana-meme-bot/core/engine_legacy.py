@@ -297,6 +297,14 @@ SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.co
 BUY_AMOUNT_SOL        = float(os.getenv("BUY_AMOUNT_SOL",        "0.1"))   # SOL per trade
 BUY_AMOUNT_USDC       = float(os.getenv("BUY_AMOUNT_USDC",       "10"))    # kept for Base chain
 
+# ── AUTO BUY toggle ────────────────────────────────────────────────
+# AUTO_BUY_ENABLED=0 (default): bot chỉ NOTIFY — khi 1 token đạt MIN_SCORE
+# và qua EntryGuard, bot gửi thông báo Telegram kèm buy-links để bạn tự
+# vào lệnh thủ công. Không ký/gửi transaction nào, không lưu position,
+# không tự bán.
+# AUTO_BUY_ENABLED=1: khôi phục hành vi tự động mua + quản lý TP/rug cũ.
+AUTO_BUY_ENABLED = str(os.getenv("AUTO_BUY_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
+
 # ── SELL / HOLD MODE ──────────────────────────────────────────────
 # SELL_MODE controls what the bot does after buying a token:
 #   "sell"  → normal auto-sell (TP + RUG + Fast Dump)         [default]
@@ -4483,6 +4491,71 @@ def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
     )
     _alert(msg)   # gửi vào TELEGRAM_CHAT_ID (bot owner)
 
+
+def send_manual_buy_alert(token: dict, score: int, detail: list):
+    """
+    Thông báo CƠ HỘI MUA — bot KHÔNG tự động mua (AUTO_BUY_ENABLED=0).
+    Gửi đến TELEGRAM_CHAT_ID kèm buy-links để tự vào lệnh thủ công.
+    Khác send_buy_signal: không có tx thật, không actual_price/slippage,
+    không TP tracking (bot không giữ position nào cho token này).
+    """
+    bar, label, border = _score_bar(score)
+    buys_24h  = token.get("buys_24h", 0)
+    sells_24h = token.get("sells_24h", 0)
+    bp        = buys_24h / max(buys_24h + sells_24h, 1) * 100
+    press     = (f"🔥 {_t('STRONG BUY','MUA MẠNH')}" if bp >= 65
+                 else (f"📈 Bullish" if bp >= 50 else f"⚠️ {_t('Bearish','Bearish')}"))
+    age       = token.get("token_age_minutes")
+    age_badge = (f"🆕 {_age_str(age)} — {_t('JUST LAUNCHED','MỚI LAUNCH')}" if age and age <= 10
+                 else f"⏰ {_age_str(age)}" if age else "N/A")
+    lp_map    = {"burned": f"🔥 {_t('LP 100% burned','LP đốt 100%')}",
+                 "locked": f"🔒 {_t('LP locked','LP khóa')}",
+                 "n/a": "—",
+                 "unknown": f"❓ {_t('Unknown','Không rõ')}"}
+    chain       = token.get("chain", "solana")
+    chain_emoji, chain_name = _chain_display(chain)
+    if chain == "solana":
+        spend_label, spend_amount = "SOL", BUY_AMOUNT_SOL
+    elif chain == "base":
+        spend_label, spend_amount = "USDC", BUY_AMOUNT_USDC
+    elif chain in NATIVE_EVM_CHAINS:
+        spend_label = chain_name
+        spend_amount = float(os.getenv(EVM_CHAINS[chain]["buy_amount_env"], "0.02"))
+    else:
+        spend_label, spend_amount = "?", 0.0
+
+    est_price = token.get("price_usd", 0)
+    tp_price  = est_price * (1 + TAKE_PROFIT_PCT / 100) if est_price > 0 else 0
+
+    chart_url = f"https://dexscreener.com/{chain}/{token['pair_address']}"
+    scan_url  = f"{_chain_explorer(chain, 'token')}{token['address']}"
+    buy_links = _build_buy_links(token)
+
+    msg = (
+        f"{chain_emoji}🔔 <b>{_t('BUY CANDIDATE','CƠ HỘI MUA')} [{chain_name}]</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>{_t('SCORE','ĐIỂM')}: {score}/100</b>  {label}\n"
+        f"{bar}\n\n"
+        f"🪙 <b>{token.get('name','?')}</b>  (<code>${token['symbol']}</code>)\n"
+        f"{age_badge}  |  {lp_map.get(token.get('lp_status','unknown'),'❓')}\n\n"
+        f"📋 <b>Contract:</b>\n"
+        f"<code>{token['address']}</code>\n"
+        f"<i>👆 {_t('Tap to copy','Nhấn để copy')}</i>\n\n"
+        f"  💰 {_t('Price','Giá')}:       <code>${est_price:.10f}</code>\n"
+        f"  💡 {_t('Suggested size','Gợi ý mua')}: <b>{spend_amount} {spend_label}</b>\n"
+        + (f"  🎯 {_t('TP target','Mục tiêu chốt')}: <code>${tp_price:.10f}</code> (+{TAKE_PROFIT_PCT:.0f}%)\n\n" if tp_price > 0 else "\n")
+        + f"💧 {_t('Liq','Liq')}: <b>{_fmt_usd(token['liquidity_usd'])}</b>  |  "
+        f"📊 {_t('Vol 1h','Vol 1h')}: <b>{_fmt_usd(token['volume_1h'])}</b>\n"
+        f"🔄 {_t('Buys','Mua')}: <b>{buys_24h}</b> | {_t('Sells','Bán')}: <b>{sells_24h}</b>  — {press} ({bp:.0f}% {_t('buys','mua')})\n"
+        f"🏊 {token['quote_symbol']} — {token['dex_key'].upper()}\n\n"
+        f"{buy_links}\n\n"
+        f"<a href='{chart_url}'>📉 Chart</a>  |  "
+        f"<a href='{scan_url}'>🔍 Explorer</a>\n"
+        f"⚠️ {_t('Bot did NOT buy — manual purchase only','Bot KHÔNG tự mua — cần bạn tự vào lệnh')}\n"
+        f"#BuyCandidate #{chain_name} ${token['symbol']}"
+    )
+    _alert(msg)   # gửi vào TELEGRAM_CHAT_ID (bot owner)
+
 def _get_sol_received_solana(sig: str) -> float:
     """
     Solana sell TX → SOL received = increase in wallet SOL balance (minus fee).
@@ -5579,6 +5652,34 @@ def confirm_entry_price(token: dict) -> tuple:
         return confirm_entry_vwap(addr, sym, chain, snapshot_price, snapshot_vol)
 
 
+def _notify_buy_candidate(token: dict, score: int, chain: str, age_min: Optional[float]):
+    """
+    Đường đi khi AUTO_BUY_ENABLED=0 (mặc định): KHÔNG ký/gửi transaction,
+    chỉ gửi thông báo Telegram để chủ bot tự vào lệnh thủ công.
+    Vẫn chạy EntryGuard (confirm_entry_price) để lọc bớt tín hiệu vào đỉnh,
+    và blacklist token sau khi đã thông báo để tránh spam lặp lại.
+    """
+    addr = token["address"]
+    sym  = token["symbol"]
+    age_log = f"{age_min:.1f}p" if age_min is not None else "N/A"
+    print(f"[Notify] 🔔 {sym} [{chain.upper()}] | Score: {score}/100 | Tuổi: {age_log}")
+
+    should_notify, confirmed_price = confirm_entry_price(token)
+    if not should_notify:
+        print(f"[Notify] ⛔ {sym}: EntryGuard từ chối → BỎ QUA (tránh đu đỉnh)")
+        return
+
+    if confirmed_price > 0 and confirmed_price != token.get("price_usd", 0):
+        token["price_usd"] = confirmed_price
+
+    try:
+        send_manual_buy_alert(token, score, token.get("_score_detail", []))
+        db_add_blacklist(addr)   # tránh thông báo lặp lại cùng 1 token
+        print(f"[Notify] ✅ {sym}: đã gửi thông báo mua thủ công")
+    except Exception as e:
+        print(f"[Notify] ❌ {sym}: gửi thông báo lỗi: {e}")
+
+
 def _execute_buy(token: dict):
     """Chạy trong thread riêng — không block buyer_thread."""
     addr   = token["address"]
@@ -5592,6 +5693,10 @@ def _execute_buy(token: dict):
 
     chain     = token.get("chain", "solana")
     age_min   = token.get("token_age_minutes")
+
+    if not AUTO_BUY_ENABLED:
+        _notify_buy_candidate(token, score, chain, age_min)
+        return
 
     # Determine buy-from token and raw amount
     # (SOL cho Solana, USDC cho Base, native currency cho BNB/ETH/Robinhood)
@@ -6275,26 +6380,33 @@ def main():
 
     print("=" * 65)
     print(f"🤖  MULTI-CHAIN TRADER v4.1  {chains_on}")
-    print(f"    Solana swap: Jupiter API v6  |  Base swap: OKX DEX  |  "
-          f"BNB/ETH/Robinhood swap: native router (PancakeSwap V2 / Uniswap V2 / Uniswap V3)")
+    if AUTO_BUY_ENABLED:
+        print(f"    Solana swap: Jupiter API v6  |  Base swap: OKX DEX  |  "
+              f"BNB/ETH/Robinhood swap: native router (PancakeSwap V2 / Uniswap V2 / Uniswap V3)")
+    else:
+        print(f"    🔔 CHẾ ĐỘ NOTIFY-ONLY — bot KHÔNG tự mua/bán. "
+              f"Set AUTO_BUY_ENABLED=1 trong .env để bật lại auto-trade.")
     print("=" * 65)
     print(f"  Wallet     : {WALLET_ADDRESS[:12]}...{WALLET_ADDRESS[-6:]}")
     print(f"  Jupiter    : {JUP_QUOTE_URL}")
-    print(f"  Buy (SOL)  : {BUY_AMOUNT_SOL} SOL / trade  (Solana)")
-    print(f"  Buy (Base) : {BUY_AMOUNT_USDC} USDC / trade (Base)")
-    for c in sorted(NATIVE_EVM_CHAINS):
-        if native_evm_status.get(c):
-            amt = os.getenv(EVM_CHAINS[c]["buy_amount_env"], "0.02")
-            print(f"  Buy ({_chain_display(c)[1]:<9}): {amt} {_chain_display(c)[1]} / trade")
-    print(f"  Sell to    : SOL (Solana) / USDC (Base) / native currency (BNB/ETH/Robinhood)")
-    # Sell mode display
-    if SELL_MODE == "hold":
-        sell_mode_str = "🔒 HOLD — never sell (manual only)"
-    elif SELL_MODE == "smart":
-        sell_mode_str = f"💎 SMART — hold if score ≥ {HOLD_MIN_SCORE}, else sell normally"
+    if AUTO_BUY_ENABLED:
+        print(f"  Buy (SOL)  : {BUY_AMOUNT_SOL} SOL / trade  (Solana)")
+        print(f"  Buy (Base) : {BUY_AMOUNT_USDC} USDC / trade (Base)")
+        for c in sorted(NATIVE_EVM_CHAINS):
+            if native_evm_status.get(c):
+                amt = os.getenv(EVM_CHAINS[c]["buy_amount_env"], "0.02")
+                print(f"  Buy ({_chain_display(c)[1]:<9}): {amt} {_chain_display(c)[1]} / trade")
+        print(f"  Sell to    : SOL (Solana) / USDC (Base) / native currency (BNB/ETH/Robinhood)")
+        # Sell mode display
+        if SELL_MODE == "hold":
+            sell_mode_str = "🔒 HOLD — never sell (manual only)"
+        elif SELL_MODE == "smart":
+            sell_mode_str = f"💎 SMART — hold if score ≥ {HOLD_MIN_SCORE}, else sell normally"
+        else:
+            sell_mode_str = "💰 SELL — auto TP + rug + fast dump"
+        print(f"  Sell mode  : {sell_mode_str}")
     else:
-        sell_mode_str = "💰 SELL — auto TP + rug + fast dump"
-    print(f"  Sell mode  : {sell_mode_str}")
+        print(f"  Mode       : 🔔 NOTIFY ONLY — gợi ý mua {BUY_AMOUNT_SOL} SOL (Solana) qua Telegram, bạn tự vào lệnh")
     print(f"  Language   : {'Vietnamese 🇻🇳' if _LANG == 'vi' else 'English 🇬🇧'} (LANG={_LANG})")
     print(f"  Min Score  : {MIN_SCORE}/100")
     print(f"  Signal Alert: score ≥ {SIGNAL_ALERT_MIN_SCORE} → thông báo bạn bè")
@@ -6317,8 +6429,12 @@ def main():
     print()
     print("  THREAD 1: Scanner   → TOKEN_QUEUE")
     print("  THREAD 2: Validator → BUY_QUEUE  (20 parallel)")
-    print("  THREAD 3: Buyer     → Jupiter (SOL) / OKX (Base)")
-    print("  THREAD 4: Monitor   → TP + Rug + Fast Dump + EMA")
+    if AUTO_BUY_ENABLED:
+        print("  THREAD 3: Buyer     → Jupiter (SOL) / OKX (Base) / native router (BNB/ETH/Robinhood)")
+        print("  THREAD 4: Monitor   → TP + Rug + Fast Dump + EMA")
+    else:
+        print("  THREAD 3: Notifier  → gửi Telegram 'CƠ HỘI MUA' kèm buy-links (không tự mua)")
+        print("  THREAD 4: Monitor   → idle (không có position tự động để theo dõi)")
     print("  THREAD 5: CmdHandler→ Telegram /block /sell /status /positions")
     print("=" * 65)
 
@@ -6547,9 +6663,12 @@ def _content_status() -> str:
     fd_pct    = cfg("FAST_DUMP_PCT")     or FAST_DUMP_PCT
     fd_win    = cfg("FAST_DUMP_WINDOW_S")or FAST_DUMP_WINDOW_S
     scan_iv   = cfg("SCAN_INTERVAL")    or SCAN_INTERVAL
+    mode_line = ("🤖 <b>AUTO-BUY</b> — bot tự động mua/bán" if AUTO_BUY_ENABLED
+                 else "🔔 <b>NOTIFY-ONLY</b> — bot chỉ gửi tín hiệu, bạn tự mua/bán")
     return (
         "📊 <b>Trạng Thái Bot</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{mode_line}\n"
         f"🔢 Vị thế đang mở: <b>{n_pos}/{int(cfg('RISK_MAX_POSITIONS') or RISK_MAX_POSITIONS)}</b>\n"
         f"⚙️  Risk: {risk_txt}\n"
         f"📡 Scanner: mỗi <b>{float(scan_iv):.0f}s</b>\n"
