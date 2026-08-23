@@ -5300,8 +5300,14 @@ def _validate_one(token: dict) -> Optional[dict]:
           f"Tuổi:{age_log} | Liq:{_fmt_usd(token['liquidity_usd'])} | "
           f"Top10:{top10_pct:.0f}% | Holders:{holder_count}")
 
-    # ── Signal Alert Top10: gom candidate và gửi bảng top định kỳ ───
+    # ── Signal Alert: thẻ chi tiết ngay cho từng token + bảng Top 10 định kỳ ──
     if score >= SIGNAL_ALERT_MIN_SCORE:
+        # Thẻ chi tiết riêng (điểm, giá, phân tích, buy-links) — gửi 1 lần/token
+        threading.Thread(
+            target=send_signal_alert, args=(token, score, detail),
+            daemon=True, name=f"signal-{addr[:8]}"
+        ).start()
+
         _update_top_signal_pool(token, score)
         # force gửi ngay khi pool đạt đủ TOP_SIGNAL_SIZE để user luôn thấy tin nhắn
         with _top_signal_lock:
