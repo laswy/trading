@@ -229,6 +229,28 @@ def _ts_print(*args, sep=" ", end="\n", file=None, flush=False):
         _real_print(msg, end=end, file=file, flush=flush)
 _builtins.print = _ts_print
 
+# ── HTTP Session Pooling ───────────────────────────────────────────
+# requests.Session tái dùng kết nối TCP/TLS thay vì mở mới mỗi request
+# → giảm latency đáng kể cho các API gọi liên tục (scan mỗi vài giây).
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except ImportError:
+    from requests.packages.urllib3.util.retry import Retry
+
+def _make_session(pool_size: int = 8) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    retry = Retry(total=0)   # retry tự quản lý ở tầng gọi (_dex_get_with_retry, ...)
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size * 2, max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+_dex_session = _make_session(pool_size=8)    # DexScreener + GeckoTerminal
+_tg_session  = _make_session(pool_size=4)    # Telegram Bot API
+_rpc_session = _make_session(pool_size=6)    # Solana/EVM RPC + Jupiter + OKX
+
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ================================================================
@@ -365,6 +387,7 @@ PRIORITY_FEE_VERY_HIGH  = int(  os.getenv("PRIORITY_FEE_VERY_HIGH","1000000"))
 RISK_MAX_POSITIONS      = int(  os.getenv("RISK_MAX_POSITIONS",    "5"))   # tối đa vị thế cùng lúc
 RISK_MAX_DAILY_TRADES   = int(  os.getenv("RISK_MAX_DAILY_TRADES", "20"))  # tối đa lệnh/ngày
 RISK_MAX_DAILY_LOSS_USD = float(os.getenv("RISK_MAX_DAILY_LOSS",  "50"))   # stop khi lỗ > $X/ngày
+RISK_CONSEC_LOSS_STOP   = int(  os.getenv("RISK_CONSEC_LOSS_STOP", "3"))   # N lệnh lỗ liên tiếp → tự pause
 VALIDATOR_WORKERS       = int(  os.getenv("VALIDATOR_WORKERS",         "20"))
 GOPLUS_RELAX_UNDER      = int(  os.getenv("GOPLUS_RELAX_UNDER_MIN",    "5"))
 SOL_MAX_PROFILE_ADDRS   = int(  os.getenv("SOL_MAX_PROFILE_ADDRS",     "40"))
@@ -757,10 +780,20 @@ def _default_native_spent(chain: str) -> float:
         return float(os.getenv(EVM_CHAINS[chain]["buy_amount_env"], "0.02"))
     return 0.0
 
-SUPPORTED_CHAINS    = {"solana", "base"}   # mở rộng runtime trong main() theo _evm_chain_ready()
+SUPPORTED_CHAINS    = {"solana", "base"}   # mở rộng runtime trong bot() theo _evm_chain_ready()
 
 # ── Rug detection ─────────────────────────────────────────────────
 RUG_PRICE_DROP_1H   = float(os.getenv("RUG_PRICE_DROP_1H", "-60"))   # % ngưỡng rug
+
+# ── Time-Based Stop — học từ bot cũ (v5): bán khi vị thế "stuck" quá lâu ──
+TIME_STOP_ENABLED  = str(os.getenv("TIME_STOP_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+TIME_STOP_MIN      = float(os.getenv("TIME_STOP_MIN",     "60"))   # giữ tối đa X phút khi đang "stuck"
+TIME_STOP_MIN_PNL  = float(os.getenv("TIME_STOP_MIN_PNL", "-3"))   # chỉ áp dụng nếu PnL hiện tại ≤ X%
+
+# ── Volume-Based Stop — học từ bot cũ (v5): chốt lời khi volume chết dần ──
+VOL_STOP_ENABLED     = str(os.getenv("VOL_STOP_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+VOL_STOP_DROP_PCT    = float(os.getenv("VOL_STOP_DROP",       "70"))  # vol 5m giảm ≥ X% từ đỉnh
+VOL_STOP_MIN_PROFIT  = float(os.getenv("VOL_STOP_MIN_PROFIT",  "8"))  # chỉ áp dụng khi đang lãi ≥ X%
 
 # ── Spam domain blocklist (social score) ─────────────────────────
 _SPAM_DOMAINS = {
@@ -891,7 +924,7 @@ def _validate_website(url: str) -> Tuple[bool, str]:
                 return True, "cached ok"
 
         try:
-            resp = requests.get(
+            resp = _rpc_session.get(
                 url if url.startswith("http") else "https://" + url,
                 timeout=10,
                 allow_redirects=True,
@@ -1065,6 +1098,9 @@ SIGNAL_ALERT_MIN_SCORE  = int(os.getenv("SIGNAL_ALERT_MIN_SCORE", "70"))   # ng�
 _signal_alert_sent: set = set()    # {mint} đã gửi signal trong session
 _signal_alert_lock      = threading.Lock()
 
+# ── Daily PnL Report — học từ bot cũ (v5) ──────────────────────────
+DAILY_REPORT_ENABLED = str(os.getenv("DAILY_REPORT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+
 TOP_SIGNAL_ENABLED      = str(os.getenv("TOP_SIGNAL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 TOP_SIGNAL_SIZE         = int(os.getenv("TOP_SIGNAL_SIZE", "10"))
 TOP_SIGNAL_INTERVAL_S   = int(os.getenv("TOP_SIGNAL_INTERVAL_S", "90"))
@@ -1202,14 +1238,20 @@ class RiskManager:
       - Giới hạn số vị thế đang mở đồng thời (RISK_MAX_POSITIONS)
       - Giới hạn số lệnh mua trong ngày (RISK_MAX_DAILY_TRADES)
       - Dừng mua khi lỗ tích lũy trong ngày vượt RISK_MAX_DAILY_LOSS_USD
-    Reset daily counter lúc 00:00 UTC mỗi ngày.
+      - Tự PAUSE khi có N lệnh lỗ liên tiếp (RISK_CONSEC_LOSS_STOP)   [học từ bot cũ]
+      - Manual PAUSE/RESUME qua Telegram /pause /resume               [học từ bot cũ]
+    Reset daily counter (+ consec loss) lúc 00:00 UTC mỗi ngày.
+    Manual pause KHÔNG bị daily reset xóa — chỉ /resume mới bỏ được.
     """
     def __init__(self):
-        self._lock         = threading.Lock()
-        self._trade_count  = 0       # lệnh đã mua hôm nay
-        self._daily_pnl    = 0.0     # lãi/lỗ tích lũy hôm nay ($)
-        self._day_key      = self._today()
-        self._paused       = False   # True = stop mua vì risk limit
+        self._lock          = threading.Lock()
+        self._trade_count   = 0       # lệnh đã mua hôm nay
+        self._daily_pnl     = 0.0     # lãi/lỗ tích lũy hôm nay ($)
+        self._day_key       = self._today()
+        self._paused        = False   # True = daily-loss hoặc consec-loss limit hit
+        self._pause_reason  = ""      # lý do cụ thể (hiển thị trong can_buy/status)
+        self._consec_losses = 0       # số lệnh lỗ liên tiếp gần nhất
+        self._manual_pause  = False   # True = user tự /pause
 
     @staticmethod
     def _today() -> str:
@@ -1218,10 +1260,12 @@ class RiskManager:
     def _check_day_reset(self):
         today = self._today()
         if today != self._day_key:
-            self._day_key     = today
-            self._trade_count = 0
-            self._daily_pnl   = 0.0
-            self._paused      = False
+            self._day_key       = today
+            self._trade_count   = 0
+            self._daily_pnl     = 0.0
+            self._paused        = False   # chỉ reset pause do daily-loss/consec-loss
+            self._pause_reason  = ""
+            self._consec_losses = 0
             print(f"[RiskManager] 🔄 Reset daily counters ({today})")
 
     def can_buy(self, open_positions: int) -> Tuple[bool, str]:
@@ -1231,8 +1275,10 @@ class RiskManager:
         """
         with self._lock:
             self._check_day_reset()
+            if self._manual_pause:
+                return False, "Đã /pause thủ công — dùng /resume để tiếp tục"
             if self._paused:
-                return False, f"Risk paused: daily loss > ${RISK_MAX_DAILY_LOSS_USD}"
+                return False, f"Risk paused: {self._pause_reason}"
             if open_positions >= RISK_MAX_POSITIONS:
                 return False, f"Đủ {open_positions}/{RISK_MAX_POSITIONS} vị thế rồi"
             if self._trade_count >= RISK_MAX_DAILY_TRADES:
@@ -1245,24 +1291,63 @@ class RiskManager:
             self._check_day_reset()
             self._trade_count += 1
             print(f"[RiskManager] 📊 Hôm nay: {self._trade_count}/{RISK_MAX_DAILY_TRADES} lệnh | "
-                  f"PnL: ${self._daily_pnl:+.2f}")
+                  f"PnL: ${self._daily_pnl:+.2f} | Consec loss: {self._consec_losses}")
 
     def record_close(self, pnl_usd: float):
-        """Gọi sau khi đóng vị thế (TP hoặc rug). pnl_usd âm = lỗ."""
+        """Gọi sau khi đóng vị thế (TP/rug/stop). pnl_usd âm = lỗ."""
         with self._lock:
             self._check_day_reset()
             self._daily_pnl += pnl_usd
+
+            # Consecutive loss tracker — học từ bot cũ (v5)
+            if pnl_usd < 0:
+                self._consec_losses += 1
+                if self._consec_losses >= RISK_CONSEC_LOSS_STOP:
+                    self._paused       = True
+                    self._pause_reason = f"{self._consec_losses} lệnh lỗ liên tiếp"
+                    print(f"[RiskManager] 🛑 {self._consec_losses} lệnh lỗ liên tiếp → DỪNG MUA")
+                    threading.Thread(
+                        target=lambda: _alert(
+                            f"⚠️ <b>RISK: {self._consec_losses} lệnh lỗ liên tiếp</b>\n"
+                            f"Bot tạm dừng mua tự động (không ảnh hưởng vị thế đang mở).\n"
+                            f"Dùng /resume trên Telegram để tiếp tục."),
+                        daemon=True
+                    ).start()
+            else:
+                self._consec_losses = 0   # reset khi có lệnh thắng
+
             if self._daily_pnl <= -abs(RISK_MAX_DAILY_LOSS_USD):
-                self._paused = True
+                self._paused       = True
+                self._pause_reason = f"daily loss > ${RISK_MAX_DAILY_LOSS_USD}"
                 print(f"[RiskManager] 🛑 Daily loss limit hit: ${self._daily_pnl:.2f} → DỪNG MUA")
-            print(f"[RiskManager] 💰 Close PnL: ${pnl_usd:+.2f} | Tổng hôm nay: ${self._daily_pnl:+.2f}")
+            print(f"[RiskManager] 💰 Close PnL: ${pnl_usd:+.2f} | Tổng hôm nay: ${self._daily_pnl:+.2f} | "
+                  f"Consec loss: {self._consec_losses}/{RISK_CONSEC_LOSS_STOP}")
+
+    def manual_pause(self):
+        with self._lock:
+            self._manual_pause = True
+            print("[RiskManager] ⏸️  Manual PAUSE")
+
+    def manual_resume(self):
+        with self._lock:
+            self._manual_pause  = False
+            self._paused        = False
+            self._pause_reason  = ""
+            self._consec_losses = 0
+            print("[RiskManager] ▶️  Manual RESUME — mọi pause đã xóa")
 
     def status(self) -> str:
         with self._lock:
             self._check_day_reset()
-            status = "🛑 PAUSED" if self._paused else "🟢 OK"
+            if self._manual_pause:
+                status = "⏸️ MANUAL PAUSE"
+            elif self._paused:
+                status = f"🛑 PAUSED ({self._pause_reason})"
+            else:
+                status = "🟢 OK"
             return (f"{status} | Lệnh: {self._trade_count}/{RISK_MAX_DAILY_TRADES} | "
                     f"PnL hôm nay: ${self._daily_pnl:+.2f} | "
+                    f"Consec loss: {self._consec_losses}/{RISK_CONSEC_LOSS_STOP} | "
                     f"Daily loss limit: ${RISK_MAX_DAILY_LOSS_USD}")
 
 _risk_manager = RiskManager()
@@ -1279,7 +1364,7 @@ def _dex_get_with_retry(url: str, label: str = "", retries: int = 3) -> Optional
     """
     for attempt in range(retries):
         try:
-            r = requests.get(url, timeout=12,
+            r = _dex_session.get(url, timeout=12,
                              headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 429:
                 wait = 2 ** attempt * 2   # 2s, 4s, 8s
@@ -1592,6 +1677,100 @@ def db_log_sell(mint: str, sell_sig: str, sell_reason: str,
           f"{sell_reason} | {sign}{net_pct:.1f}% | hold={hold_s}s")
 
 
+def db_finalize_trade_history(mint: str, sell_sig: str, chain: str):
+    """
+    Chạy nền sau khi bán: db_log_sell() ghi native_received=0 tạm thời
+    (chưa có TX confirm lúc gọi). Hàm này chờ TX confirm rồi đọc lại số
+    native thực nhận về, sửa lại net_profit_native/net_profit_pct trong
+    trade_history cho đúng — nếu không, db_get_pnl_stats() sẽ tính sai
+    (mọi lệnh hiện ra như lỗ 100%).
+    """
+    if not sell_sig:
+        return
+    try:
+        confirmed = _wait_tx_confirmed(sell_sig, chain, mint[:8])
+        if not confirmed:
+            return
+        native_received = _get_usdc_received_from_sell_tx(sell_sig, chain, mint[:8])
+        if native_received <= 0:
+            return
+        with _db_lock:
+            conn = _get_conn()
+            row = conn.execute("""
+                SELECT id, native_spent FROM trade_history
+                WHERE mint=? AND sell_sig=? ORDER BY buy_time DESC LIMIT 1
+            """, (mint, sell_sig)).fetchone()
+            if not row:
+                conn.close()
+                return
+            native_spent = float(row["native_spent"] or 0)
+            net_profit   = native_received - native_spent
+            net_pct      = (net_profit / native_spent * 100) if native_spent > 0 else 0.0
+            conn.execute("""
+                UPDATE trade_history
+                SET native_received=?, net_profit_native=?, net_profit_pct=?
+                WHERE id=?
+            """, (native_received, net_profit, net_pct, row["id"]))
+            conn.commit()
+            conn.close()
+        sign = "+" if net_profit >= 0 else ""
+        print(f"[TradeLog] 🔧 PnL thực {mint[:12]}...: {sign}{net_profit:.6f} ({sign}{net_pct:.1f}%)")
+    except Exception as e:
+        print(f"[TradeLog] ⚠️  finalize {mint[:12]}...: {e}")
+
+
+def db_get_pnl_stats(days: int = 1) -> dict:
+    """
+    Thống kê PnL từ trade_history — học từ bot cũ (v5), điều chỉnh cho schema
+    hiện tại (usd_spent đã quy đổi USD sẵn ở lúc mua → PnL USD ước tính =
+    usd_spent × net_profit_pct/100, cộng dồn được across nhiều chain khác
+    nhau vì đã cùng đơn vị USD, khác với native_spent lẫn lộn SOL/USDC/BNB/ETH).
+    days=1 → hôm nay (24h gần nhất theo UTC), days=7 → 7 ngày, days=0 → tất cả.
+    Chỉ tính các lệnh đã đóng (sell_time NOT NULL).
+    """
+    cutoff = int(time.time()) - days * 86400 if days > 0 else 0
+    with _db_lock:
+        conn = _get_conn()
+        rows = conn.execute("""
+            SELECT * FROM trade_history
+            WHERE sell_time IS NOT NULL AND sell_time >= ?
+            ORDER BY sell_time DESC
+        """, (cutoff,)).fetchall()
+        conn.close()
+
+    trades = [dict(r) for r in rows]
+    total  = len(trades)
+    if total == 0:
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+                "total_pnl_usd": 0.0, "avg_pct": 0.0, "best_pct": 0.0,
+                "worst_pct": 0.0, "avg_hold_min": 0.0, "by_reason": {}}
+
+    wins   = sum(1 for t in trades if t["net_profit_pct"] >= 0)
+    losses = total - wins
+    pnl_usd_per_trade = [float(t.get("usd_spent") or 0) * float(t.get("net_profit_pct") or 0) / 100
+                          for t in trades]
+    total_pnl_usd = sum(pnl_usd_per_trade)
+    pcts    = [float(t.get("net_profit_pct") or 0) for t in trades]
+    avg_pct = sum(pcts) / total
+    best_pct  = max(pcts)
+    worst_pct = min(pcts)
+    avg_hold  = sum(int(t.get("hold_duration_s") or 0) for t in trades) / total
+
+    by_reason: Dict[str, dict] = {}
+    for t, pnl in zip(trades, pnl_usd_per_trade):
+        r = t.get("sell_reason") or "?"
+        d = by_reason.setdefault(r, {"count": 0, "pnl_usd": 0.0})
+        d["count"] += 1
+        d["pnl_usd"] += pnl
+
+    return {
+        "total": total, "wins": wins, "losses": losses,
+        "win_rate": (wins / total * 100), "total_pnl_usd": total_pnl_usd,
+        "avg_pct": avg_pct, "best_pct": best_pct, "worst_pct": worst_pct,
+        "avg_hold_min": avg_hold / 60, "by_reason": by_reason,
+    }
+
+
 def db_export_csv(filepath: str = "trade_history.csv") -> str:
     """
     Xuất toàn bộ trade_history ra CSV.
@@ -1845,7 +2024,7 @@ def _send_tg(text: str, chat_id: str = None) -> bool:
         if not cid:
             continue
         try:
-            resp = requests.post(
+            resp = _tg_session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": cid, "text": text, "parse_mode": "HTML",
                       "disable_web_page_preview": True},
@@ -1898,7 +2077,7 @@ def okx_get(path: str, params: dict, _retries: int = 4) -> Optional[dict]:
     for attempt in range(_retries):
         with _okx_semaphore:   # chờ slot trống trước khi gọi
             try:
-                r = requests.get(url, headers=hdrs, timeout=15)
+                r = _rpc_session.get(url, headers=hdrs, timeout=15)
 
                 # 429 → back-off rồi retry
                 if r.status_code == 429:
@@ -1993,7 +2172,7 @@ def _sign_and_send_tx(tx_b64: str) -> Optional[str]:
         encoded         = base64.b64encode(signed_tx_bytes).decode()
 
         # ── 6. Gửi lên RPC ──────────────────────────────────────────────────
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method":  "sendTransaction",
             "params":  [encoded, {
@@ -2042,7 +2221,7 @@ def _wait_tx_confirmed(sig: str, chain: str, label: str = "",
                     print(f"[Confirm] ❌ {label}: TX revert (status=0)")
                     return False
             else:
-                resp = requests.post(SOLANA_RPC_URL, json={
+                resp = _rpc_session.post(SOLANA_RPC_URL, json={
                     "jsonrpc": "2.0", "id": 1,
                     "method": "getSignatureStatuses",
                     "params": [[sig], {"searchTransactionHistory": True}]
@@ -2089,7 +2268,7 @@ def _get_sol_spent_solana(sig: str) -> float:
     Returns float SOL. 0.0 if cannot parse.
     """
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
             "params": [sig, {
@@ -2124,7 +2303,7 @@ def _get_usdc_spent_solana(sig: str) -> float:
     Delta âm = ví đã gửi đi (= USDC đã tiêu thực tế).
     """
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
             "params": [sig, {
@@ -2969,7 +3148,7 @@ def _get_dynamic_priority_fee(chain: str = "solana") -> int:
     if chain != "solana":
         return PRIORITY_FEE_DEFAULT
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getRecentPrioritizationFees",
             "params": []
@@ -2995,7 +3174,7 @@ def _jup_get(params: dict) -> Optional[dict]:
     """
     for attempt in range(JUP_RETRIES):
         try:
-            r = requests.get(JUP_QUOTE_URL, params=params,
+            r = _rpc_session.get(JUP_QUOTE_URL, params=params,
                              timeout=JUP_TIMEOUT,
                              headers={"Accept": "application/json"})
             r.raise_for_status()
@@ -3028,7 +3207,7 @@ def _jup_post(body: dict) -> Optional[dict]:
     """
     for attempt in range(JUP_RETRIES):
         try:
-            r = requests.post(JUP_SWAP_URL, json=body,
+            r = _rpc_session.post(JUP_SWAP_URL, json=body,
                               timeout=JUP_TIMEOUT,
                               headers={"Content-Type": "application/json",
                                        "Accept": "application/json"})
@@ -3075,7 +3254,7 @@ def _broadcast_tx(signed_tx_b64: str, sig: str) -> bool:
         label    = "Helius RPC" if HELIUS_API_KEY else "Solana RPC"
 
     try:
-        resp = requests.post(endpoint, json={
+        resp = _rpc_session.post(endpoint, json={
             "jsonrpc": "2.0", "id": 1,
             "method":  "sendTransaction",
             "params":  [signed_tx_b64, {
@@ -3236,7 +3415,7 @@ def get_token_raw_balance(mint: str, chain: str = "solana") -> str:
         return get_token_raw_balance_evm(chain, mint)
     # Solana path
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getTokenAccountsByOwner",
             "params": [WALLET_ADDRESS, {"mint": mint}, {"encoding": "jsonParsed"}]
@@ -3253,7 +3432,7 @@ def get_token_raw_balance(mint: str, chain: str = "solana") -> str:
 
 def get_token_decimals_rpc(mint: str) -> int:
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getAccountInfo",
             "params": [mint, {"encoding": "jsonParsed"}]
@@ -3287,7 +3466,7 @@ def check_goplus(addr: str, age_min: Optional[float] = None,
         else:
             addr_q = addr
             url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={addr_q}"
-        r = requests.get(url, timeout=10)
+        r = _rpc_session.get(url, timeout=10)
         r.raise_for_status()
         result = r.json().get("result", {})
         res = result.get(addr_q) or result.get(addr) or {}
@@ -3308,7 +3487,7 @@ def check_goplus(addr: str, age_min: Optional[float] = None,
 
 def check_lp_status(addr: str) -> str:
     try:
-        r = requests.get(
+        r = _rpc_session.get(
             f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={addr}",
             timeout=10
         )
@@ -3823,7 +4002,7 @@ def fetch_gecko_new_pool_addresses() -> List[str]:
                     addrs.append(addr)
             continue
         try:
-            r = requests.get(
+            r = _dex_session.get(
                 url,
                 timeout=10,
                 headers={
@@ -3860,7 +4039,7 @@ def get_price_usd(addr: str, chain: str = "solana") -> float:
     if cached is not None:
         return cached
     try:
-        r    = requests.get(
+        r    = _dex_session.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=10)
         data = r.json()
         ps   = data.get("pairs", []) if isinstance(data, dict) else []
@@ -3897,7 +4076,7 @@ def get_sol_price_usd(max_age_s: float = 30.0) -> float:
 
     # Source 1: DexScreener — SOL/USDC pair (Raydium)
     try:
-        r = requests.get(
+        r = _dex_session.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{SOL_NATIVE}",
             timeout=8, headers={"User-Agent": "Mozilla/5.0"}
         )
@@ -3918,7 +4097,7 @@ def get_sol_price_usd(max_age_s: float = 30.0) -> float:
     # Source 2: Jupiter price API (fallback)
     if price <= 0:
         try:
-            r = requests.get(
+            r = _rpc_session.get(
                 f"https://lite-api.jup.ag/price/v2?ids={SOL_NATIVE}",
                 timeout=8
             )
@@ -4562,7 +4741,7 @@ def _get_sol_received_solana(sig: str) -> float:
     post_balance[0] - pre_balance[0] + fee = SOL received (if positive).
     """
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
             "params": [sig, {
@@ -4612,7 +4791,7 @@ def _get_usdc_received_solana(sig: str) -> float:
     post_amount - pre_amount > 0 → ví nhận vào.
     """
     try:
-        resp = requests.post(SOLANA_RPC_URL, json={
+        resp = _rpc_session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getTransaction",
             "params": [sig, {
@@ -5222,7 +5401,7 @@ ENTRY_VWAP_TOL_PCT      = float(os.getenv("ENTRY_VWAP_TOL_PCT",      "1.0"))# to
 def _fetch_price_dex(addr: str, chain: str) -> float:
     """Lấy giá realtime từ DexScreener (bypass cache riêng cho confirm)."""
     try:
-        r = requests.get(
+        r = _dex_session.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=8)
         data = r.json()
         ps   = data.get("pairs", []) if isinstance(data, dict) else []
@@ -5239,7 +5418,7 @@ def _fetch_price_and_volume_dex(addr: str, chain: str) -> tuple:
     Trả về (price: float, vol_5m: float).
     """
     try:
-        r    = requests.get(
+        r    = _dex_session.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=8)
         data = r.json()
         ps   = data.get("pairs", []) if isinstance(data, dict) else []
@@ -5993,7 +6172,10 @@ def _sell_position(pos: dict, reason: str = "TP") -> Optional[str]:
 
 
 def monitor_thread(stop_event: threading.Event):
-    print("[Monitor] 🟢 Bắt đầu theo dõi giá (TP + Rug + Fast Dump + EMA)...")
+    print("[Monitor] 🟢 Bắt đầu theo dõi giá "
+          "(TP + Rug + Fast Dump + Time Stop + Vol Stop + EMA)...")
+    # vol_peak[mint] = vol 5m cao nhất từng thấy khi đang hold — học từ bot cũ (v5)
+    vol_peak: Dict[str, float] = {}
     while not stop_event.is_set():
         try:
             positions = db_get_positions()
@@ -6076,8 +6258,12 @@ def monitor_thread(stop_event: threading.Event):
                     native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                     _risk_manager.record_close(-native_spent * abs(fast_dump) / 100)
                     _price_tracker.remove(mint)
+                    vol_peak.pop(mint, None)
                     if ok:
                         db_log_sell(mint, sell_sig_fd or "", "FAST_DUMP", cur, 0.0)
+                        if sell_sig_fd:
+                            threading.Thread(target=db_finalize_trade_history,
+                                              args=(mint, sell_sig_fd, chain), daemon=True).start()
                     db_add_perm_ban(mint, f"fast_dump={fast_dump:.1f}%")
                     db_close_position(mint)
                     if not ok:
@@ -6131,8 +6317,12 @@ def monitor_thread(stop_event: threading.Event):
                             native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                             _risk_manager.record_close(-native_spent * abs(drop_pct) / 100)
                             _price_tracker.remove(mint)
+                            vol_peak.pop(mint, None)
                             if ok:
                                 db_log_sell(mint, sell_sig_rug or "", "RUG", cur, 0.0)
+                                if sell_sig_rug:
+                                    threading.Thread(target=db_finalize_trade_history,
+                                                      args=(mint, sell_sig_rug, chain), daemon=True).start()
                             db_add_perm_ban(mint, f"rug_detected drop={drop_pct:.1f}%")
                             db_close_position(mint)
                             if not ok:
@@ -6200,8 +6390,12 @@ def monitor_thread(stop_event: threading.Event):
                     native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                     _risk_manager.record_close(-native_spent * abs(drop_pct) / 100)
                     _price_tracker.remove(mint)
+                    vol_peak.pop(mint, None)
                     if ok:
                         db_log_sell(mint, sell_sig_rug or "", "RUG", cur, 0.0)
+                        if sell_sig_rug:
+                            threading.Thread(target=db_finalize_trade_history,
+                                              args=(mint, sell_sig_rug, chain), daemon=True).start()
                     # Dù bán được hay không, cấm vĩnh viễn
                     db_add_perm_ban(mint, f"rug_detected drop={drop_pct:.1f}%")
                     db_close_position(mint)
@@ -6210,6 +6404,91 @@ def monitor_thread(stop_event: threading.Event):
                             f"❌ Bán RUG thất bại: {sym}\n"
                             f"<code>{mint}</code> — bán thủ công ngay!")
                     continue
+
+                # ── TIME-BASED STOP — học từ bot cũ (v5) ────────────
+                # Bán khi hold quá lâu mà vẫn đang gần huề vốn/lỗ nhẹ (stuck),
+                # để giải phóng vốn thay vì ôm bag chết vô thời hạn.
+                if TIME_STOP_ENABLED:
+                    hold_min = (time.time() - pos.get("entry_time", time.time())) / 60
+                    if hold_min >= TIME_STOP_MIN and pct <= TIME_STOP_MIN_PNL:
+                        print(f"  [Monitor] ⏰ TIME STOP: {sym} | hold {hold_min:.0f}p | "
+                              f"PnL {pct:+.1f}% ≤ {TIME_STOP_MIN_PNL}% → BÁN")
+                        to_token = _sell_to_token(chain)
+                        raw = get_token_raw_balance(mint, chain=chain)
+                        if raw == "0":
+                            db_close_position(mint)
+                            _price_tracker.remove(mint)
+                            vol_peak.pop(mint, None)
+                            continue
+                        sell_sig_ts = execute_swap(mint, to_token, raw,
+                                                   label=f"TIME_STOP {sym}", chain=chain)
+                        if sell_sig_ts:
+                            native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
+                            _risk_manager.record_close(native_spent * pct / 100)
+                            db_log_sell(mint, sell_sig_ts, "TIME_STOP", cur, 0.0)
+                            threading.Thread(target=db_finalize_trade_history,
+                                              args=(mint, sell_sig_ts, chain), daemon=True).start()
+                            _alert(
+                                f"⏰🟡 <b>TIME STOP [{chain_name}]</b>\n"
+                                f"🪙 <b>${sym}</b>\n"
+                                f"Hold {hold_min:.0f}p | PnL <b>{pct:+.1f}%</b>\n"
+                                f"Bot bán để giải phóng vốn (stuck quá lâu)."
+                            )
+                        else:
+                            send_error_alert(f"❌ Bán TIME_STOP thất bại: {sym}\n<code>{mint}</code>")
+                        _price_tracker.remove(mint)
+                        vol_peak.pop(mint, None)
+                        db_close_position(mint)
+                        continue
+
+                # ── VOLUME-BASED STOP — học từ bot cũ (v5) ──────────
+                # Đang lãi nhưng volume 5m sập mạnh từ đỉnh → thanh khoản có
+                # thể cạn dần, chốt lời bảo toàn thay vì chờ TP2/trailing.
+                if VOL_STOP_ENABLED and pct >= VOL_STOP_MIN_PROFIT:
+                    vol5m_now = 0.0
+                    try:
+                        pairs_raw = fetch_token_pairs(mint)
+                        if pairs_raw:
+                            vol5m_now = float((pairs_raw[0].get("volume") or {}).get("m5", 0) or 0)
+                    except Exception:
+                        vol5m_now = 0.0
+
+                    if vol5m_now > 0:
+                        peak = vol_peak.get(mint, 0.0)
+                        if vol5m_now > peak:
+                            vol_peak[mint] = vol5m_now
+                        elif peak > 0:
+                            vol_drop = (peak - vol5m_now) / peak * 100
+                            if vol_drop >= VOL_STOP_DROP_PCT:
+                                print(f"  [Monitor] 📉 VOL STOP: {sym} | vol5m ${vol5m_now:.0f} "
+                                      f"vs peak ${peak:.0f} (-{vol_drop:.0f}%) + lãi {pct:+.1f}% → BÁN")
+                                to_token = _sell_to_token(chain)
+                                raw = get_token_raw_balance(mint, chain=chain)
+                                if raw == "0":
+                                    db_close_position(mint)
+                                    _price_tracker.remove(mint)
+                                    vol_peak.pop(mint, None)
+                                    continue
+                                sell_sig_vs = execute_swap(mint, to_token, raw,
+                                                           label=f"VOL_STOP {sym}", chain=chain)
+                                if sell_sig_vs:
+                                    native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
+                                    _risk_manager.record_close(native_spent * pct / 100)
+                                    db_log_sell(mint, sell_sig_vs, "VOL_STOP", cur, 0.0)
+                                    threading.Thread(target=db_finalize_trade_history,
+                                                      args=(mint, sell_sig_vs, chain), daemon=True).start()
+                                    _alert(
+                                        f"📉🟡 <b>VOL STOP [{chain_name}]</b>\n"
+                                        f"🪙 <b>${sym}</b>\n"
+                                        f"Volume 5m -{vol_drop:.0f}% từ đỉnh | Lãi <b>{pct:+.1f}%</b>\n"
+                                        f"Bot chốt lời bảo toàn."
+                                    )
+                                else:
+                                    send_error_alert(f"❌ Bán VOL_STOP thất bại: {sym}\n<code>{mint}</code>")
+                                _price_tracker.remove(mint)
+                                vol_peak.pop(mint, None)
+                                db_close_position(mint)
+                                continue
 
                 # ── TAKE PROFIT + TRAILING STOP ────────────────────
                 #
@@ -6285,6 +6564,7 @@ def monitor_thread(stop_event: threading.Event):
                     if raw == "0":
                         db_close_position(mint)
                         _price_tracker.remove(mint)
+                        vol_peak.pop(mint, None)
                         continue
                     sell_sig = execute_swap(mint, to_token, raw,
                                             label=f"SELL TP {sym}", chain=chain)
@@ -6292,8 +6572,12 @@ def monitor_thread(stop_event: threading.Event):
                         native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                         _risk_manager.record_close(native_spent * pct / 100)
                         _price_tracker.remove(mint)
-                        # Log sell — native_received=0 tạm thời; send_tp_signal sẽ đọc TX thực
+                        vol_peak.pop(mint, None)
+                        # Log sell — native_received=0 tạm thời; send_tp_signal sẽ đọc TX thực,
+                        # db_finalize_trade_history sửa lại DB sau khi TX confirm.
                         db_log_sell(mint, sell_sig, "TP", cur, 0.0)
+                        threading.Thread(target=db_finalize_trade_history,
+                                          args=(mint, sell_sig, chain), daemon=True).start()
                         db_mark_tp_sent(mint)
                         db_close_position(mint)
                         print(f"  [Monitor] ✅ {sym} TP xong | +{pct:.1f}% → tính lãi thực...")
@@ -6323,10 +6607,45 @@ def monitor_thread(stop_event: threading.Event):
         stop_event.wait(_tp_int if positions else float(cfg("TP_CHECK_INTERVAL_OLD") or TP_CHECK_INTERVAL))
 
 # ================================================================
+# WATCHDOG — học từ bot cũ (v5): tự restart thread nào chết bất ngờ
+# ================================================================
+
+def watchdog_thread(stop_event: threading.Event, managed: dict):
+    """
+    Kiểm tra mỗi 15s, tự restart thread nào đã chết (exception không bắt
+    được thoát ra ngoài vòng lặp chính của thread đó).
+    managed = {"active": {tên: Thread}, "specs": {tên: (target_fn, args)}}
+    `active` được chia sẻ (mutable dict) với bot() nên restart ở đây cũng
+    cập nhật luôn danh sách active mà bot() dùng khi shutdown/join.
+    """
+    print("[Watchdog] 🟢 Bắt đầu giám sát threads...")
+    active: Dict[str, threading.Thread] = managed["active"]
+    specs:  Dict[str, tuple]            = managed["specs"]
+
+    while not stop_event.is_set():
+        stop_event.wait(15)
+        if stop_event.is_set():
+            break
+        for name, (target, args) in specs.items():
+            t = active.get(name)
+            if t is None or not t.is_alive():
+                print(f"[Watchdog] ⚠️  Thread '{name}' đã chết — đang restart...")
+                new_t = threading.Thread(target=target, args=args, name=name, daemon=True)
+                new_t.start()
+                active[name] = new_t
+                print(f"[Watchdog] ✅ Thread '{name}' đã restart.")
+                threading.Thread(
+                    target=lambda n=name: _alert(
+                        f"⚠️ <b>Watchdog</b>: Thread <code>{n}</code> đã chết và được restart tự động."),
+                    daemon=True
+                ).start()
+
+
+# ================================================================
 # MAIN
 # ================================================================
 
-def main():
+def bot():
     # Init dynamic config từ .env
     _cfg_init()
 
@@ -6436,6 +6755,9 @@ def main():
         print("  THREAD 3: Notifier  → gửi Telegram 'CƠ HỘI MUA' kèm buy-links (không tự mua)")
         print("  THREAD 4: Monitor   → idle (không có position tự động để theo dõi)")
     print("  THREAD 5: CmdHandler→ Telegram /block /sell /status /positions")
+    print("  THREAD 6: Watchdog  → tự restart thread chết")
+    if DAILY_REPORT_ENABLED:
+        print("  THREAD 7: DailyPnL  → báo cáo PnL lúc 00:00 UTC")
     print("=" * 65)
 
     stop = threading.Event()
@@ -6454,25 +6776,38 @@ def main():
             except Exception as _e:
                 print(f"[TradeLog] ❌ Auto-export lỗi: {_e}")
 
-    threads = [
-        threading.Thread(target=scanner_thread,     args=(stop,), name="Scanner",   daemon=True),
-        threading.Thread(target=validator_thread,   args=(stop,), name="Validator", daemon=True),
-        threading.Thread(target=buyer_thread,       args=(stop,), name="Buyer",     daemon=True),
-        threading.Thread(target=monitor_thread,     args=(stop,), name="Monitor",   daemon=True),
-        threading.Thread(target=_csv_export_thread, args=(stop,), name="CSVExport", daemon=True),
-        threading.Thread(target=telegram_cmd_thread,args=(stop,), name="CmdHandler",daemon=True),
-    ]
+    # specs = {tên thread: (hàm target, args)} — Watchdog dùng để tự restart
+    # nếu thread nào chết bất ngờ (học từ bot cũ — v5).
+    specs: Dict[str, tuple] = {
+        "Scanner":    (scanner_thread,      (stop,)),
+        "Validator":  (validator_thread,    (stop,)),
+        "Buyer":      (buyer_thread,        (stop,)),
+        "Monitor":    (monitor_thread,      (stop,)),
+        "CSVExport":  (_csv_export_thread,  (stop,)),
+        "CmdHandler": (telegram_cmd_thread, (stop,)),
+    }
+    if DAILY_REPORT_ENABLED:
+        specs["DailyPnL"] = (daily_report_thread, (stop,))
 
-    for t in threads:
+    active: Dict[str, threading.Thread] = {}
+    for name, (target, args) in specs.items():
+        t = threading.Thread(target=target, args=args, name=name, daemon=True)
         t.start()
+        active[name] = t
+
+    watchdog = threading.Thread(
+        target=watchdog_thread, args=(stop, {"active": active, "specs": specs}),
+        name="Watchdog", daemon=True,
+    )
+    watchdog.start()
 
     try:
-        while all(t.is_alive() for t in threads):
+        while not stop.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n\n👋 Đang dừng...")
         stop.set()
-        for t in threads:
+        for t in list(active.values()) + [watchdog]:
             t.join(timeout=5)
         # Export CSV khi thoát
         try:
@@ -6515,7 +6850,7 @@ _manual_sell_lock = threading.Lock()
 def _tg_api(method: str, payload: dict) -> Optional[dict]:
     """Gọi Telegram Bot API. Trả về response JSON hoặc None nếu lỗi."""
     try:
-        r = requests.post(
+        r = _tg_session.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
             json=payload, timeout=10,
         )
@@ -6823,6 +7158,68 @@ def _content_report() -> str:
         return f"❌ Lỗi báo cáo: {ex}"
 
 
+def _content_pnl(days: int = 1) -> str:
+    """
+    /pnl [N] — PnL quy đổi USD, cộng dồn được across mọi chain (khác /report
+    vốn cộng theo native unit nên không gộp được SOL+USDC+BNB+ETH).
+    days=0 → toàn bộ lịch sử.
+    """
+    try:
+        st = db_get_pnl_stats(days=days)
+        period = "Tất cả" if days == 0 else ("Hôm nay (24h)" if days == 1 else f"{days} ngày qua")
+        if st["total"] == 0:
+            return f"📊 <b>PnL — {period}</b>\n━━━━━━━━━━━━━━━━━━━━\n📭 Chưa có lệnh nào đóng trong khoảng này."
+
+        emoji = "🤑" if st["total_pnl_usd"] >= 0 else "😞"
+        sign  = "+" if st["total_pnl_usd"] >= 0 else ""
+        lines = [
+            f"📊 <b>PnL — {period}</b> {emoji}",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"📈 Tổng lệnh   : <b>{st['total']}</b>  (🟢 {st['wins']} thắng / 🔴 {st['losses']} thua)",
+            f"🎯 Win rate    : <b>{st['win_rate']:.1f}%</b>",
+            f"💰 PnL tổng    : <b>{sign}{st['total_pnl_usd']:.2f} USD</b> (ước tính)",
+            f"📊 PnL TB/lệnh : <b>{st['avg_pct']:+.2f}%</b>",
+            f"🏆 Tốt nhất    : <b>{st['best_pct']:+.1f}%</b>  |  💔 Tệ nhất: <b>{st['worst_pct']:+.1f}%</b>",
+            f"⏱ Hold TB     : <b>{st['avg_hold_min']:.1f} phút</b>",
+            "",
+            "<b>Theo loại thoát:</b>",
+        ]
+        reason_e = {"TP": "💰", "RUG": "🚨", "FAST_DUMP": "⚡", "MANUAL": "👤",
+                    "TIME_STOP": "⏰", "VOL_STOP": "📉"}
+        for r, v in sorted(st["by_reason"].items(), key=lambda x: -abs(x[1]["pnl_usd"])):
+            e = reason_e.get(r, "❓")
+            s = "+" if v["pnl_usd"] >= 0 else ""
+            lines.append(f"  {e} {r}: {v['count']} lệnh | {s}{v['pnl_usd']:.2f} USD")
+        return "\n".join(lines)
+    except Exception as ex:
+        return f"❌ Lỗi /pnl: {ex}"
+
+
+def send_daily_pnl_report():
+    """Gửi báo cáo PnL ngày vừa rồi lúc 00:00 UTC — học từ bot cũ (v5)."""
+    try:
+        _alert(_content_pnl(days=1).replace("PnL — Hôm nay (24h)", "Daily PnL Report"))
+        print("[DailyReport] 📊 Đã gửi báo cáo PnL ngày.")
+    except Exception as e:
+        print(f"[DailyReport] ❌ {e}")
+
+
+def daily_report_thread(stop_event: threading.Event):
+    """Canh giờ 00:00 UTC mỗi ngày → gửi báo cáo PnL — học từ bot cũ (v5)."""
+    if not DAILY_REPORT_ENABLED:
+        print("[DailyReport] ⏭  DAILY_REPORT_ENABLED=0 — bỏ qua thread này.")
+        return
+    print("[DailyReport] 🟢 Đang chờ 00:00 UTC...")
+    last_day = ""
+    while not stop_event.is_set():
+        now   = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        if now.hour == 0 and now.minute == 0 and today != last_day:
+            last_day = today
+            send_daily_pnl_report()
+        stop_event.wait(30)
+
+
 def _content_guide() -> str:
     return (
         "❓ <b>Hướng Dẫn Sử Dụng</b>\n"
@@ -6841,7 +7238,10 @@ def _content_guide() -> str:
         "<code>/save</code> — Lưu vào .env\n"
         "<code>/block MINT</code> — Block nhanh\n"
         "<code>/sell MINT</code> — Bán nhanh\n"
-        "<code>/profile early_sniper|safe_trend</code> — Đổi profile A/B\n<code>/scores [N]</code> — Xem thống kê điểm token vừa quét\n\n"
+        "<code>/profile early_sniper|safe_trend</code> — Đổi profile A/B\n<code>/scores [N]</code> — Xem thống kê điểm token vừa quét\n"
+        "<code>/pause</code> — Tạm dừng mua mới (vị thế mở vẫn theo dõi bình thường)\n"
+        "<code>/resume</code> — Tiếp tục mua sau /pause hoặc sau khi risk tự pause\n"
+        "<code>/pnl [N]</code> — PnL quy đổi USD N ngày qua (mặc định 1, 0=tất cả)\n\n"
         "⚙️ <b>Ví dụ /set:</b>\n"
         "<code>/set BUY_AMOUNT_SOL 0.05</code>\n"
         "<code>/set MIN_SCORE 80</code>\n"
@@ -7028,6 +7428,8 @@ def _do_sell_mint(chat_id: str, mint: str, origin_msg_id: int = None):
             entry_p   = float(pos.get("entry_price") or 0)
             pct = ((cur_price / entry_p - 1) * 100) if entry_p > 0 and cur_price > 0 else 0
             db_log_sell(mint, sell_sig, "MANUAL", cur_price, 0.0)
+            threading.Thread(target=db_finalize_trade_history,
+                              args=(mint, sell_sig, chain), daemon=True).start()
             db_close_position(mint)
             _price_tracker.remove(mint)
             pct_str  = f"{'🟢' if pct >= 0 else '🔴'}{pct:+.1f}%"
@@ -7227,6 +7629,23 @@ def _handle_text_command(chat_id: str, text: str):
                 daemon=True, name=f"sell-{arg[:8]}"
             ).start()
 
+    elif command == "/pause":
+        _risk_manager.manual_pause()
+        _reply(chat_id,
+               "⏸️ <b>Đã PAUSE.</b> Bot ngừng mua mới (vị thế đang mở vẫn được theo dõi/bán bình thường).\n"
+               "Dùng /resume để tiếp tục.", _BACK_KB)
+
+    elif command == "/resume":
+        _risk_manager.manual_resume()
+        _reply(chat_id, "▶️ <b>Đã RESUME.</b> Bot tiếp tục mua bình thường.", _BACK_KB)
+
+    elif command == "/pnl":
+        try:
+            days = int(arg) if arg else 1
+        except Exception:
+            days = 1
+        _reply(chat_id, _content_pnl(days), _BACK_KB)
+
     else:
         _show_menu(chat_id)
 
@@ -7289,7 +7708,7 @@ def telegram_cmd_thread(stop_event: threading.Event):
 
     # Skip tất cả tin cũ khi mới khởi động
     try:
-        r = requests.get(
+        r = _tg_session.get(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
             params={"offset": -1, "limit": 1}, timeout=15,
         )
@@ -7312,7 +7731,7 @@ def telegram_cmd_thread(stop_event: threading.Event):
             with _tg_cmd_lock:
                 offset = _tg_cmd_offset
 
-            r = requests.get(
+            r = _tg_session.get(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                 params={
                     "offset":          offset,
@@ -7347,4 +7766,4 @@ def telegram_cmd_thread(stop_event: threading.Event):
 
 
 if __name__ == "__main__":
-    main()
+    bot()
