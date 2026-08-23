@@ -1363,6 +1363,32 @@ _CACHE_TTL_PROFILE  = float(os.getenv("CACHE_TTL_PROFILE_S",  "30"))   # Profile
 _CACHE_TTL_NEWPAIRS = float(os.getenv("CACHE_TTL_NEWPAIRS_S", "10"))   # /new: 10s
 _CACHE_TTL_PAIRS    = float(os.getenv("CACHE_TTL_PAIRS_S",    "8"))    # /tokens/{addr}: 8s
 
+# ── DexScreener rate limiter ────────────────────────────────────────
+# Thêm BNB/ETH/Robinhood làm số request/chu kỳ tăng mạnh (nhiều địa chỉ hơn
+# + thêm 3 endpoint /new) → dễ dồn burst và ăn 429 liên tục (retry vẫn bắn
+# lại ở tốc độ cũ nên cứ 429 mãi). Giới hạn tốc độ gọi NGAY TỪ ĐẦU thay vì
+# chỉ lùi lại sau khi đã bị 429 — mọi request DexScreener (cả /tokens/{addr}
+# lẫn /new) đều đi qua _dex_get_with_retry nên giới hạn ở đây là chặn chung.
+_DEX_MAX_RPS = float(os.getenv("DEX_MAX_REQUESTS_PER_SEC", "4"))   # ~240 req/phút, dưới ngưỡng 429 thường gặp
+
+class _RateLimiter:
+    """Giãn cách request tối thiểu `1/max_per_sec` giây — dùng chung giữa nhiều thread."""
+    def __init__(self, max_per_sec: float):
+        self._min_interval  = 1.0 / max(max_per_sec, 0.1)
+        self._lock           = threading.Lock()
+        self._next_allowed_at = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            start_at = max(now, self._next_allowed_at)
+            self._next_allowed_at = start_at + self._min_interval
+        sleep_s = start_at - now
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+_dex_rate_limiter = _RateLimiter(_DEX_MAX_RPS)
+
 def _dex_get_with_retry(url: str, label: str = "", retries: int = 3) -> Optional[requests.Response]:
     """
     GET với retry + exponential backoff khi gặp 429.
@@ -1370,6 +1396,7 @@ def _dex_get_with_retry(url: str, label: str = "", retries: int = 3) -> Optional
     """
     for attempt in range(retries):
         try:
+            _dex_rate_limiter.wait()
             r = _dex_session.get(url, timeout=12,
                              headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 429:
