@@ -1,0 +1,15 @@
+# Secrets — KHÔNG BAO GIỜ commit
+.env
+
+# Virtualenv tạo bởi run.sh
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime data (DB, log điểm, export CSV)
+positions.db
+trade_history.csv
+data/*.jsonl
