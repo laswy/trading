@@ -42,7 +42,7 @@ không tự chốt lời/cắt lỗ.
 Muốn quay lại chế độ tự động mua + quản lý TP/rug/trailing-stop như trước:
 đặt `AUTO_BUY_ENABLED=1` trong `.env`.
 
-Log khởi động (`python main.py`) in rõ đang chạy chế độ nào (`🔔 CHẾ ĐỘ
+Log khởi động (`python bot.py`) in rõ đang chạy chế độ nào (`🔔 CHẾ ĐỘ
 NOTIFY-ONLY` hoặc banner auto-trade đầy đủ), và lệnh Telegram `/status` luôn
 hiển thị mode hiện tại ở đầu.
 
@@ -75,13 +75,13 @@ Trước khi điền vào `.env`:
 3. Test với `BUY_AMOUNT_ETH_ROBINHOOD` cực nhỏ (vd `0.001`) trước khi tăng lên
    mức thật.
 
-Log khởi động (`python main.py`) sẽ in rõ chain nào ENABLED/DISABLED và lý do
+Log khởi động (`python bot.py`) sẽ in rõ chain nào ENABLED/DISABLED và lý do
 thiếu config, ví dụ `⚠️ ROBINHOOD chain DISABLED (thiếu: thiếu router address)`.
 
 ## 3) Chạy bot
 
 ```bash
-python main.py
+python bot.py
 ```
 
 Bot sẽ:
@@ -135,6 +135,31 @@ Gợi ý vận hành:
 - Chạy optimizer sau mỗi 1-2 ngày có đủ số lệnh.
 - A/B theo block thời gian cố định để so sánh công bằng.
 - Luôn backup `.env` trước khi `--apply`.
+
+## 5b) Bảo vệ vốn nâng cao (chỉ áp dụng khi `AUTO_BUY_ENABLED=1`)
+
+Các tính năng dưới đây học từ 1 bản bot cũ, chỉ có tác dụng khi bot đang tự
+động mua/bán (`AUTO_BUY_ENABLED=1`) — ở chế độ notify-only chúng không chạy
+vì không có vị thế tự động nào để theo dõi.
+
+- **Tự pause khi lỗ liên tiếp** (`RISK_CONSEC_LOSS_STOP`, mặc định 3): sau N
+  lệnh lỗ liên tiếp, bot tự dừng mua mới (vị thế đang mở vẫn được theo dõi/bán
+  bình thường). Dùng `/resume` trên Telegram để tiếp tục.
+- **Pause/Resume thủ công**: `/pause` dừng mua ngay lập tức, `/resume` mở lại
+  — hữu ích khi muốn tạm ngừng mà không cần tắt bot.
+- **Time-Based Stop** (`TIME_STOP_ENABLED`, `TIME_STOP_MIN`, `TIME_STOP_MIN_PNL`):
+  bán vị thế nếu giữ quá `TIME_STOP_MIN` phút mà PnL vẫn ≤ `TIME_STOP_MIN_PNL`%
+  (đang "stuck") — giải phóng vốn thay vì ôm bag vô thời hạn.
+- **Volume-Based Stop** (`VOL_STOP_ENABLED`, `VOL_STOP_DROP`, `VOL_STOP_MIN_PROFIT`):
+  đang lãi ≥ `VOL_STOP_MIN_PROFIT`% nhưng volume 5m sập ≥ `VOL_STOP_DROP`% từ
+  đỉnh → chốt lời bảo toàn trước khi thanh khoản cạn, không chờ TP2/trailing.
+- **Watchdog**: tự restart thread nào chết bất ngờ (không cần bạn tự khởi động
+  lại bot), kèm cảnh báo Telegram mỗi lần restart.
+- **Daily PnL Report** (`DAILY_REPORT_ENABLED`): gửi báo cáo PnL quy đổi USD
+  lúc 00:00 UTC mỗi ngày. Xem thủ công bất kỳ lúc nào bằng `/pnl [N]` (N ngày,
+  mặc định 1, 0 = toàn bộ lịch sử) — khác `/report` (chỉ 24h, cộng theo native
+  unit nên không gộp được PnL giữa SOL/USDC/BNB/ETH), `/pnl` quy đổi USD nên
+  cộng dồn đúng across mọi chain.
 
 ## 6) Quy trình vận hành khuyến nghị
 
