@@ -2,7 +2,23 @@
 
 Tài liệu này hướng dẫn chạy bot từ đầu, áp dụng profile, tối ưu tham số tự động và checklist vận hành an toàn.
 
-## 1) Chuẩn bị môi trường
+## 0) Chạy nhanh (Linux, 1 lệnh)
+
+Từ thư mục `solana-meme-bot/`:
+
+```bash
+./run.sh
+```
+
+Script tự làm: tạo `.venv` nếu chưa có → cài `requirements.txt` → nếu chưa có
+`.env` thì tạo từ `.env.example` rồi dừng lại để bạn điền secrets → lần chạy
+tiếp theo sẽ tự động khởi động bot. Không cần làm thủ công các bước ở mục 1-2
+bên dưới nữa — chỉ cần chạy lại `./run.sh` sau khi điền xong `.env`.
+
+Nếu `./run.sh: Permission denied`, chạy `chmod +x run.sh` một lần rồi thử lại
+(hoặc dùng `bash run.sh`).
+
+## 1) Chuẩn bị môi trường thủ công (nếu không dùng run.sh)
 
 Từ thư mục `solana-meme-bot/`:
 
@@ -83,6 +99,8 @@ thiếu config, ví dụ `⚠️ ROBINHOOD chain DISABLED (thiếu: thiếu rout
 ```bash
 python bot.py
 ```
+
+(hoặc đơn giản hơn: `./run.sh` — xem mục 0)
 
 Bot sẽ:
 
