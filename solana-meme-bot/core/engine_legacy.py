@@ -361,6 +361,7 @@ VALIDATOR_WORKERS       = int(  os.getenv("VALIDATOR_WORKERS",         "20"))
 GOPLUS_RELAX_UNDER      = int(  os.getenv("GOPLUS_RELAX_UNDER_MIN",    "5"))
 SOL_MAX_PROFILE_ADDRS   = int(  os.getenv("SOL_MAX_PROFILE_ADDRS",     "40"))
 BASE_MAX_PROFILE_ADDRS  = int(  os.getenv("BASE_MAX_PROFILE_ADDRS",    "40"))  # FIX: quota riêng cho Base
+EVM_NATIVE_MAX_PROFILE_ADDRS = int(os.getenv("EVM_NATIVE_MAX_PROFILE_ADDRS", "40"))  # quota/chain cho bsc/ethereum/robinhood
 SOL_PREFILTER_MIN_SCORE = int(  os.getenv("SOL_PREFILTER_MIN_SCORE",   "25"))
 SCORE_GREEN           = int(  os.getenv("SCORE_GREEN_MIN",        "70"))
 SCORE_YELLOW          = int(  os.getenv("SCORE_YELLOW_MIN",       "40"))
@@ -628,9 +629,127 @@ SOLANA_VALID_QUOTES = {"SOL", "WSOL", "USDC", "USDT"}
 BASE_CHAIN_INDEX    = "8453"
 BASE_USDC           = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_RPC_URL        = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
-BASE_WALLET_PRIVKEY = os.getenv("BASE_PRIVATE_KEY", "")   # hex, 0x-prefixed optional
+# EVM_PRIVATE_KEY dùng chung cho MỌI chain EVM (Base/BNB/ETH/Robinhood) vì
+# địa chỉ ví giống nhau trên toàn bộ EVM (secp256k1). BASE_PRIVATE_KEY được
+# giữ lại làm fallback để không phá config của user đang chạy Base sẵn.
+EVM_WALLET_PRIVKEY  = os.getenv("EVM_PRIVATE_KEY", "") or os.getenv("BASE_PRIVATE_KEY", "")
+BASE_WALLET_PRIVKEY = EVM_WALLET_PRIVKEY   # alias giữ tương thích ngược
 BASE_VALID_QUOTES   = {"ETH", "WETH", "USDC", "USDT"}
-SUPPORTED_CHAINS    = {"solana", "base"}
+
+# ── EVM chain registry (BNB / ETH / Robinhood Chain — native DEX swap) ──
+# router_style: "okx" (Base, giữ nguyên OKX aggregator hiện có) |
+#               "v2" (Uniswap-V2-style router: PancakeSwap/Uniswap V2) |
+#               "v3" (Uniswap-V3-style: QuoterV2 + SwapRouter02, dùng cho
+#                     Robinhood Chain vì chỉ xác nhận có V3 deploy)
+#
+# ⚠️ Robinhood Chain (chain_id 4663) mới mainnet từ 7/2026. router_address /
+# quoter_address / wrapped_native KHÔNG có default hardcode — bắt buộc user
+# tự xác minh trên https://robinhoodchain.blockscout.com rồi điền vào .env
+# trước khi bật trading thật trên chain này. Xem docs/USAGE_GUIDE.md.
+EVM_CHAINS: Dict[str, dict] = {
+    "base": {
+        "chain_id": 8453, "dexscreener_slug": "base", "router_style": "okx",
+        "goplus_chain_id": "8453", "emoji": "🔵", "display_name": "BASE",
+        "explorer_tx": "https://basescan.org/tx/",
+        "explorer_token": "https://basescan.org/token/",
+    },
+    # NOTE: key dict PHẢI khớp đúng giá trị `chainId` mà DexScreener trả về —
+    # toàn bộ codebase lấy token["chain"] trực tiếp từ đó (xem _pair_to_token).
+    # DexScreener dùng "bsc" cho BNB Smart Chain, "ethereum" cho ETH mainnet —
+    # KHÔNG phải "bnb"/"eth".
+    "bsc": {
+        "chain_id": 56, "dexscreener_slug": "bsc",
+        "rpc_url": os.getenv("BNB_RPC_URL", "https://bsc-dataseed.binance.org"),
+        "router_style": "v2",
+        "router_address": os.getenv("BNB_ROUTER_ADDRESS", "0x10ED43C718714eb63d5aA57B78B54704E256024E"),  # PancakeSwap V2
+        "wrapped_native": os.getenv("BNB_WBNB_ADDRESS", "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
+        "buy_amount_env": "BUY_AMOUNT_BNB", "goplus_chain_id": "56",
+        "emoji": "🟡", "display_name": "BNB",
+        "explorer_tx": "https://bscscan.com/tx/",
+        "explorer_token": "https://bscscan.com/token/",
+    },
+    "ethereum": {
+        "chain_id": 1, "dexscreener_slug": "ethereum",
+        "rpc_url": os.getenv("ETH_RPC_URL", ""),   # cần RPC riêng (Infura/Alchemy) — bsc-style public RPC không tồn tại ổn định cho ETH
+        "router_style": "v2",
+        "router_address": os.getenv("ETH_ROUTER_ADDRESS", "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"),  # Uniswap V2
+        "wrapped_native": os.getenv("ETH_WETH_ADDRESS", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        "buy_amount_env": "BUY_AMOUNT_ETH", "goplus_chain_id": "1",
+        "emoji": "⚪", "display_name": "ETH",
+        "explorer_tx": "https://etherscan.io/tx/",
+        "explorer_token": "https://etherscan.io/token/",
+    },
+    "robinhood": {
+        "chain_id": 4663, "dexscreener_slug": "robinhood",
+        "rpc_url": os.getenv("ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"),
+        "router_style": "v3",
+        "router_address": os.getenv("ROBINHOOD_ROUTER_ADDRESS", ""),   # KHÔNG default — xem cảnh báo ở trên
+        "quoter_address": os.getenv("ROBINHOOD_QUOTER_ADDRESS", ""),   # KHÔNG default
+        "wrapped_native": os.getenv("ROBINHOOD_WETH_ADDRESS", ""),     # KHÔNG default
+        "pool_fee_tier": int(os.getenv("ROBINHOOD_POOL_FEE_TIER", "3000")),
+        "buy_amount_env": "BUY_AMOUNT_ETH_ROBINHOOD", "goplus_chain_id": None,  # GoPlus chưa xác nhận hỗ trợ chain này
+        "emoji": "🟢", "display_name": "ROBINHOOD",
+        "explorer_tx": "https://robinhoodchain.blockscout.com/tx/",
+        "explorer_token": "https://robinhoodchain.blockscout.com/token/",
+    },
+}
+NATIVE_EVM_CHAINS = {"bsc", "ethereum", "robinhood"}   # swap qua router riêng, KHÔNG qua OKX
+
+# chain slug → tiền tố biến .env con người dễ đọc hơn (BSC dùng tên "BNB_*")
+_ENV_PREFIX_BY_CHAIN = {"bsc": "BNB", "ethereum": "ETH", "robinhood": "ROBINHOOD"}
+
+def _evm_chain_ready(chain: str) -> Tuple[bool, str]:
+    """Kiểm tra 1 chain EVM-native đã đủ config để bật trading chưa."""
+    if chain not in EVM_CHAINS:
+        return False, f"chain lạ: {chain}"
+    cfg_c = EVM_CHAINS[chain]
+    if chain in NATIVE_EVM_CHAINS:
+        prefix = _ENV_PREFIX_BY_CHAIN.get(chain, chain.upper())
+        if not cfg_c.get("rpc_url"):
+            return False, f"thiếu RPC ({prefix}_RPC_URL)"
+        if not cfg_c.get("router_address"):
+            return False, f"thiếu router address ({prefix}_ROUTER_ADDRESS)"
+        if cfg_c.get("router_style") == "v3" and not cfg_c.get("quoter_address"):
+            return False, f"thiếu quoter address ({prefix}_QUOTER_ADDRESS)"
+        if not cfg_c.get("wrapped_native"):
+            return False, f"thiếu wrapped-native address ({prefix}_WETH_ADDRESS)"
+    if not EVM_WALLET_PRIVKEY:
+        return False, "thiếu EVM_PRIVATE_KEY"
+    return True, ""
+
+def _chain_display(chain: str) -> Tuple[str, str]:
+    """Trả về (emoji, display_name) cho 1 chain — dùng thay ternary rải rác."""
+    if chain == "solana":
+        return "🟣", "SOLANA"
+    c = EVM_CHAINS.get(chain)
+    return (c["emoji"], c["display_name"]) if c else ("⚫", chain.upper())
+
+def _chain_explorer(chain: str, kind: str = "tx") -> str:
+    """Trả về base URL explorer (tx hoặc token) cho 1 chain."""
+    if chain == "solana":
+        return "https://solscan.io/tx/" if kind == "tx" else "https://solscan.io/token/"
+    c = EVM_CHAINS.get(chain, {})
+    return c.get(f"explorer_{kind}", "")
+
+def _sell_to_token(chain: str) -> str:
+    """Token đích khi bán: USDC (Base), native currency (BNB/ETH/Robinhood), SOL (Solana)."""
+    if chain == "base":
+        return BASE_USDC
+    if chain in NATIVE_EVM_CHAINS:
+        return EVM_NATIVE_SENTINEL
+    return SOL_NATIVE
+
+def _default_native_spent(chain: str) -> float:
+    """Giá trị fallback usdc_spent nếu DB thiếu (không nên xảy ra bình thường)."""
+    if chain == "solana":
+        return BUY_AMOUNT_SOL
+    if chain == "base":
+        return BUY_AMOUNT_USDC
+    if chain in NATIVE_EVM_CHAINS:
+        return float(os.getenv(EVM_CHAINS[chain]["buy_amount_env"], "0.02"))
+    return 0.0
+
+SUPPORTED_CHAINS    = {"solana", "base"}   # mở rộng runtime trong main() theo _evm_chain_ready()
 
 # ── Rug detection ─────────────────────────────────────────────────
 RUG_PRICE_DROP_1H   = float(os.getenv("RUG_PRICE_DROP_1H", "-60"))   # % ngưỡng rug
@@ -1684,7 +1803,7 @@ def _content_score_history(limit: int = 200) -> str:
         for r in recent:
             sym = r.get("symbol", "?")
             sc = int(r.get("score", 0))
-            ch = "SOL" if r.get("chain") == "solana" else "BASE"
+            ch = _chain_display(r.get("chain", "solana"))[1]
             icon = "✅" if sc >= cur_min_score else "⏭"
             token_lines.append(f"{icon} <b>${sym}</b> [{ch}] — {sc}/100")
 
@@ -1895,15 +2014,15 @@ def _wait_tx_confirmed(sig: str, chain: str, label: str = "",
     """
     Poll đến khi TX confirmed hoặc hết timeout.
     Solana: getSignatureStatuses — trả về confirmed/finalized.
-    Base:   eth_getTransactionReceipt — status=1 là thành công.
+    Base/BNB/ETH/Robinhood: eth_getTransactionReceipt — status=1 là thành công.
     Trả về True nếu confirmed OK, False nếu timeout hoặc lỗi.
     """
     for attempt in range(max_attempts):
         time.sleep(interval)
         try:
-            if chain == "base":
+            if chain == "base" or chain in NATIVE_EVM_CHAINS:
                 from web3 import Web3
-                w3   = _get_base_w3()
+                w3   = _get_base_w3() if chain == "base" else _get_evm_w3(chain)
                 rcpt = w3.eth.get_transaction_receipt(sig)
                 if rcpt is None:
                     continue
@@ -1935,14 +2054,16 @@ def _wait_tx_confirmed(sig: str, chain: str, label: str = "",
 
 def _get_spend_from_tx(sig: str, chain: str, label: str = "") -> float:
     """
-    Reads confirmed TX → returns actual amount spent (SOL for Solana, USDC for Base).
+    Reads confirmed TX → returns actual amount spent
+    (SOL for Solana, USDC for Base, native currency for BNB/ETH/Robinhood).
     Returns 0.0 if cannot parse.
     """
     try:
         if chain == "base":
             return _get_usdc_spent_base(sig)
-        else:
-            return _get_sol_spent_solana(sig)
+        if chain in NATIVE_EVM_CHAINS:
+            return _get_native_spent_evm(sig, chain)
+        return _get_sol_spent_solana(sig)
     except Exception as e:
         print(f"[Confirm] ⚠️  {label} parse spend: {e}")
         return 0.0
@@ -2361,6 +2482,427 @@ def get_token_raw_balance_base(token_addr: str) -> str:
         return "0"
 
 # ================================================================
+# NATIVE-DEX SWAP  (BNB / ETH / Robinhood Chain)
+# ================================================================
+# Base tiếp tục dùng OKX aggregator (execute_swap_base ở trên, không đổi).
+# 3 chain mới swap thẳng qua router on-chain: PancakeSwap V2 (BNB),
+# Uniswap V2 (ETH), Uniswap V3 SwapRouter02 (Robinhood Chain).
+#
+# Quy ước: "NATIVE" đại diện cho native currency (BNB/ETH) trong
+# from_token/to_token — không có địa chỉ ERC-20 thật cho native coin.
+# ================================================================
+
+EVM_NATIVE_SENTINEL = "NATIVE"
+
+_ERC20_MIN_ABI = [
+    {"inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}],
+     "name": "allowance", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "spender", "type": "address"}, {"name": "value", "type": "uint256"}],
+     "name": "approve", "outputs": [{"name": "", "type": "bool"}],
+     "stateMutability": "nonpayable", "type": "function"},
+]
+
+_WETH9_MIN_ABI = [
+    {"inputs": [], "name": "deposit", "outputs": [],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
+]
+
+_UNISWAP_V2_ROUTER_ABI = [
+    {"inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "path", "type": "address[]"}],
+     "name": "getAmountsOut", "outputs": [{"name": "amounts", "type": "uint256[]"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [
+        {"name": "amountOutMin", "type": "uint256"}, {"name": "path", "type": "address[]"},
+        {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
+     "name": "swapExactETHForTokensSupportingFeeOnTransferTokens", "outputs": [],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [
+        {"name": "amountIn", "type": "uint256"}, {"name": "amountOutMin", "type": "uint256"},
+        {"name": "path", "type": "address[]"}, {"name": "to", "type": "address"},
+        {"name": "deadline", "type": "uint256"}],
+     "name": "swapExactTokensForETHSupportingFeeOnTransferTokens", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
+]
+
+_UNISWAP_V3_QUOTER_ABI = [
+    {"inputs": [{"components": [
+        {"name": "tokenIn", "type": "address"}, {"name": "tokenOut", "type": "address"},
+        {"name": "amountIn", "type": "uint256"}, {"name": "fee", "type": "uint24"},
+        {"name": "sqrtPriceLimitX96", "type": "uint160"}],
+        "name": "params", "type": "tuple"}],
+     "name": "quoteExactInputSingle",
+     "outputs": [{"name": "amountOut", "type": "uint256"},
+                 {"name": "sqrtPriceX96After", "type": "uint160"},
+                 {"name": "initializedTicksCrossed", "type": "uint32"},
+                 {"name": "gasEstimate", "type": "uint256"}],
+     "stateMutability": "nonpayable", "type": "function"},
+]
+
+_UNISWAP_V3_ROUTER_ABI = [
+    {"inputs": [{"components": [
+        {"name": "tokenIn", "type": "address"}, {"name": "tokenOut", "type": "address"},
+        {"name": "fee", "type": "uint24"}, {"name": "recipient", "type": "address"},
+        {"name": "amountIn", "type": "uint256"}, {"name": "amountOutMinimum", "type": "uint256"},
+        {"name": "sqrtPriceLimitX96", "type": "uint160"}],
+        "name": "params", "type": "tuple"}],
+     "name": "exactInputSingle", "outputs": [{"name": "amountOut", "type": "uint256"}],
+     "stateMutability": "payable", "type": "function"},
+]
+
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def _get_evm_w3(chain: str):
+    """Web3 instance cho 1 EVM-native chain (bnb/eth/robinhood)."""
+    from web3 import Web3
+    rpc = EVM_CHAINS.get(chain, {}).get("rpc_url", "")
+    if not rpc:
+        raise RuntimeError(f"Thiếu RPC URL cho chain {chain}")
+    return Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+
+
+def _get_evm_wallet_address() -> str:
+    """Địa chỉ ví EVM (giống nhau trên mọi EVM chain) từ EVM_PRIVATE_KEY."""
+    if not EVM_WALLET_PRIVKEY:
+        return ""
+    try:
+        from web3 import Web3
+        privkey = EVM_WALLET_PRIVKEY if EVM_WALLET_PRIVKEY.startswith("0x") \
+                  else "0x" + EVM_WALLET_PRIVKEY
+        return Web3().eth.account.from_key(privkey).address
+    except Exception as e:
+        print(f"[EVM] ⚠️  Không lấy được wallet address: {e}")
+        return ""
+
+
+def get_token_raw_balance_evm(chain: str, token_addr: str) -> str:
+    """Số dư ERC-20 (raw) trên 1 EVM-native chain (bnb/eth/robinhood)."""
+    try:
+        from web3 import Web3
+        w3     = _get_evm_w3(chain)
+        wallet = _get_evm_wallet_address()
+        if not wallet:
+            return "0"
+        abi = [{"inputs": [{"name": "_owner", "type": "address"}],
+                "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view", "type": "function"}]
+        contract = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=abi)
+        return str(contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call())
+    except Exception as e:
+        print(f"[{chain.upper()}] ❌ get_balance: {e}")
+        return "0"
+
+
+def _send_evm_tx_and_wait(w3, tx: dict, privkey: str, label: str,
+                           max_attempts: int = 10, interval: float = 3.0) -> Optional[str]:
+    """Ký + gửi 1 EVM tx, chờ confirm tối đa max_attempts*interval giây.
+    Trả về tx hash (hex, có 0x) nếu confirmed (status=1), None nếu revert/lỗi.
+    Timeout → trả về hash vẫn (optimistic, giống pattern _ensure_usdc_allowance)."""
+    try:
+        signed = w3.eth.account.sign_transaction(tx, privkey)
+        raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+        tx_hash = w3.eth.send_raw_transaction(raw_tx).hex()
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+        print(f"[EVM] ⏳ {label}: {tx_hash[:20]}... → chờ confirm")
+        for attempt in range(max_attempts):
+            time.sleep(interval)
+            try:
+                rcpt = w3.eth.get_transaction_receipt(tx_hash)
+                if rcpt is None:
+                    continue
+                if int(rcpt["status"]) == 1:
+                    print(f"[EVM] ✅ {label} confirmed")
+                    return tx_hash
+                print(f"[EVM] ❌ {label} revert (status=0)")
+                return None
+            except Exception:
+                continue
+        print(f"[EVM] ⏰ {label} timeout ({max_attempts * interval:.0f}s) → coi như đã gửi")
+        return tx_hash
+    except Exception as e:
+        print(f"[EVM] ❌ {label} lỗi gửi tx: {e}")
+        return None
+
+
+def _ensure_erc20_allowance(w3, acct, token_addr: str, spender: str, amount_raw: int,
+                             privkey: str, chain_id: int) -> bool:
+    """Approve tổng quát cho router (BNB/ETH/Robinhood) — giống _ensure_usdc_allowance
+    nhưng dùng được cho bất kỳ token ERC-20 nào (cần khi bán token mới mua)."""
+    from web3 import Web3
+    MAX_UINT256 = 2**256 - 1
+    token_cs    = Web3.to_checksum_address(token_addr)
+    spender_cs  = Web3.to_checksum_address(spender)
+    try:
+        token = w3.eth.contract(address=token_cs, abi=_ERC20_MIN_ABI)
+        current = token.functions.allowance(acct.address, spender_cs).call()
+        if current >= amount_raw:
+            return True
+        gas_price = w3.eth.gas_price
+        approve_tx = token.functions.approve(spender_cs, MAX_UINT256).build_transaction({
+            "from": acct.address,
+            "nonce": w3.eth.get_transaction_count(acct.address),
+            "gas": 80_000,
+            "gasPrice": gas_price,
+            "chainId": chain_id,
+        })
+        result = _send_evm_tx_and_wait(w3, approve_tx, privkey, "Approve")
+        return result is not None
+    except Exception as e:
+        print(f"[EVM] ❌ _ensure_erc20_allowance: {e}")
+        return False
+
+
+def _uniswap_v2_amounts_out(w3, router_addr: str, amount_in: int, path: List[str]) -> Optional[int]:
+    from web3 import Web3
+    try:
+        router = w3.eth.contract(address=Web3.to_checksum_address(router_addr), abi=_UNISWAP_V2_ROUTER_ABI)
+        path_cs = [Web3.to_checksum_address(p) for p in path]
+        amounts = router.functions.getAmountsOut(amount_in, path_cs).call()
+        return int(amounts[-1])
+    except Exception as e:
+        print(f"[EVM] ⚠️  getAmountsOut: {e}")
+        return None
+
+
+def _swap_uniswap_v2(chain: str, from_token: str, to_token: str, amount_raw: str,
+                      label: str = "SWAP", token_age_min: Optional[float] = None) -> Optional[str]:
+    """Swap qua router kiểu Uniswap-V2 (PancakeSwap V2 cho BNB, Uniswap V2 cho ETH).
+    from_token/to_token == EVM_NATIVE_SENTINEL đại diện cho native currency."""
+    if not EVM_WALLET_PRIVKEY:
+        print(f"[{chain.upper()}] ❌ EVM_PRIVATE_KEY chưa set trong .env")
+        return None
+    cfg_c = EVM_CHAINS[chain]
+    router_addr = cfg_c.get("router_address", "")
+    wrapped     = cfg_c.get("wrapped_native", "")
+    if not router_addr or not wrapped:
+        print(f"[{chain.upper()}] ❌ Thiếu router/wrapped-native address trong .env")
+        return None
+
+    from web3 import Web3
+    w3      = _get_evm_w3(chain)
+    privkey = EVM_WALLET_PRIVKEY if EVM_WALLET_PRIVKEY.startswith("0x") else "0x" + EVM_WALLET_PRIVKEY
+    acct    = w3.eth.account.from_key(privkey)
+    router_cs = Web3.to_checksum_address(router_addr)
+    amount_in = int(amount_raw)
+
+    is_buy = (from_token == EVM_NATIVE_SENTINEL)
+    path = ([wrapped, to_token] if is_buy else [from_token, wrapped])
+
+    quoted = _uniswap_v2_amounts_out(w3, router_addr, amount_in, path)
+    if quoted is None or quoted <= 0:
+        print(f"[{chain.upper()}] ❌ {label}: không lấy được quote (có thể chưa có pool V2)")
+        return None
+    dyn_slippage = _get_dynamic_slippage(token_age_min)
+    amount_out_min = int(quoted * (1 - dyn_slippage / 100.0))
+    deadline = int(time.time()) + 120
+
+    router = w3.eth.contract(address=router_cs, abi=_UNISWAP_V2_ROUTER_ABI)
+    try:
+        if is_buy:
+            tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+                amount_out_min, [Web3.to_checksum_address(p) for p in path],
+                acct.address, deadline,
+            ).build_transaction({
+                "from": acct.address, "value": amount_in,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "gas": 400_000, "gasPrice": w3.eth.gas_price,
+                "chainId": cfg_c["chain_id"],
+            })
+        else:
+            ok = _ensure_erc20_allowance(w3, acct, from_token, router_addr, amount_in,
+                                          privkey, cfg_c["chain_id"])
+            if not ok:
+                print(f"[{chain.upper()}] ❌ {label}: approve thất bại → hủy swap")
+                return None
+            tx = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+                amount_in, amount_out_min, [Web3.to_checksum_address(p) for p in path],
+                acct.address, deadline,
+            ).build_transaction({
+                "from": acct.address,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "gas": 400_000, "gasPrice": w3.eth.gas_price,
+                "chainId": cfg_c["chain_id"],
+            })
+        return _send_evm_tx_and_wait(w3, tx, privkey, label, max_attempts=15, interval=3.0)
+    except Exception as e:
+        print(f"[{chain.upper()}] ❌ {label}: {e}")
+        return None
+
+
+def _swap_uniswap_v3(chain: str, from_token: str, to_token: str, amount_raw: str,
+                      label: str = "SWAP", token_age_min: Optional[float] = None) -> Optional[str]:
+    """Swap qua Uniswap V3 (QuoterV2 + SwapRouter02) — dùng cho Robinhood Chain.
+    Buy: wrap native→WETH rồi exactInputSingle(WETH→token).
+    Sell: exactInputSingle(token→WETH) rồi unwrap WETH→native."""
+    if not EVM_WALLET_PRIVKEY:
+        print(f"[{chain.upper()}] ❌ EVM_PRIVATE_KEY chưa set trong .env")
+        return None
+    cfg_c = EVM_CHAINS[chain]
+    router_addr  = cfg_c.get("router_address", "")
+    quoter_addr  = cfg_c.get("quoter_address", "")
+    wrapped      = cfg_c.get("wrapped_native", "")
+    fee_tier     = cfg_c.get("pool_fee_tier", 3000)
+    if not router_addr or not quoter_addr or not wrapped:
+        print(f"[{chain.upper()}] ❌ Thiếu router/quoter/wrapped-native address trong .env "
+              f"— PHẢI tự xác minh trên block explorer trước khi bật chain này.")
+        return None
+
+    from web3 import Web3
+    w3      = _get_evm_w3(chain)
+    privkey = EVM_WALLET_PRIVKEY if EVM_WALLET_PRIVKEY.startswith("0x") else "0x" + EVM_WALLET_PRIVKEY
+    acct    = w3.eth.account.from_key(privkey)
+    chain_id = cfg_c["chain_id"]
+    amount_in = int(amount_raw)
+    is_buy = (from_token == EVM_NATIVE_SENTINEL)
+    token_in  = wrapped if is_buy else from_token
+    token_out = to_token if is_buy else wrapped
+
+    # ── Quote (staticcall, không tốn gas) ─────────────────────────
+    try:
+        quoter = w3.eth.contract(address=Web3.to_checksum_address(quoter_addr), abi=_UNISWAP_V3_QUOTER_ABI)
+        result = quoter.functions.quoteExactInputSingle((
+            Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out),
+            amount_in, fee_tier, 0,
+        )).call()
+        quoted = int(result[0])
+    except Exception as e:
+        print(f"[{chain.upper()}] ❌ {label}: quote lỗi (pool fee {fee_tier} có thể không tồn tại): {e}")
+        return None
+    if quoted <= 0:
+        print(f"[{chain.upper()}] ❌ {label}: quote = 0")
+        return None
+    dyn_slippage = _get_dynamic_slippage(token_age_min)
+    amount_out_min = int(quoted * (1 - dyn_slippage / 100.0))
+
+    weth   = w3.eth.contract(address=Web3.to_checksum_address(wrapped), abi=_WETH9_MIN_ABI + _ERC20_MIN_ABI)
+    router = w3.eth.contract(address=Web3.to_checksum_address(router_addr), abi=_UNISWAP_V3_ROUTER_ABI)
+
+    try:
+        if is_buy:
+            # Bước 1: wrap native → WETH
+            wrap_tx = weth.functions.deposit().build_transaction({
+                "from": acct.address, "value": amount_in,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "gas": 60_000, "gasPrice": w3.eth.gas_price, "chainId": chain_id,
+            })
+            if not _send_evm_tx_and_wait(w3, wrap_tx, privkey, f"{label} (wrap WETH)"):
+                return None
+            # Bước 2: approve WETH → router
+            if not _ensure_erc20_allowance(w3, acct, wrapped, router_addr, amount_in, privkey, chain_id):
+                print(f"[{chain.upper()}] ❌ {label}: approve WETH thất bại")
+                return None
+            # Bước 3: exactInputSingle WETH → token
+            swap_tx = router.functions.exactInputSingle((
+                Web3.to_checksum_address(wrapped), Web3.to_checksum_address(to_token),
+                fee_tier, acct.address, amount_in, amount_out_min, 0,
+            )).build_transaction({
+                "from": acct.address,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "gas": 400_000, "gasPrice": w3.eth.gas_price, "chainId": chain_id,
+            })
+            return _send_evm_tx_and_wait(w3, swap_tx, privkey, label, max_attempts=15, interval=3.0)
+        else:
+            # Bước 1: approve token → router
+            if not _ensure_erc20_allowance(w3, acct, from_token, router_addr, amount_in, privkey, chain_id):
+                print(f"[{chain.upper()}] ❌ {label}: approve token thất bại")
+                return None
+            # Bước 2: exactInputSingle token → WETH (nhận WETH về ví)
+            swap_tx = router.functions.exactInputSingle((
+                Web3.to_checksum_address(from_token), Web3.to_checksum_address(wrapped),
+                fee_tier, acct.address, amount_in, amount_out_min, 0,
+            )).build_transaction({
+                "from": acct.address,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "gas": 400_000, "gasPrice": w3.eth.gas_price, "chainId": chain_id,
+            })
+            swap_hash = _send_evm_tx_and_wait(w3, swap_tx, privkey, label, max_attempts=15, interval=3.0)
+            if not swap_hash:
+                return None
+            # Bước 3: đọc WETH thực nhận từ log Transfer, rồi unwrap → native
+            # (dùng đúng pattern truy cập topics/data dạng hex-string như
+            #  _get_usdc_spent_base ở trên, đã kiểm chứng với web3.py bản này)
+            try:
+                rcpt = w3.eth.get_transaction_receipt(swap_hash)
+                weth_received = 0
+                wallet_lower = acct.address.lower()
+                for log in rcpt.get("logs", []):
+                    if log.get("address", "").lower() != wrapped.lower():
+                        continue
+                    topics = log.get("topics", [])
+                    if not topics or topics[0].lower() != _TRANSFER_TOPIC:
+                        continue
+                    if len(topics) < 3:
+                        continue
+                    to_addr = "0x" + topics[2][-40:]
+                    if to_addr.lower() == wallet_lower:
+                        weth_received = int(log.get("data", "0x0"), 16)
+                if weth_received > 0:
+                    unwrap_tx = weth.functions.withdraw(weth_received).build_transaction({
+                        "from": acct.address,
+                        "nonce": w3.eth.get_transaction_count(acct.address),
+                        "gas": 60_000, "gasPrice": w3.eth.gas_price, "chainId": chain_id,
+                    })
+                    _send_evm_tx_and_wait(w3, unwrap_tx, privkey, f"{label} (unwrap WETH)")
+            except Exception as e:
+                print(f"[{chain.upper()}] ⚠️  {label}: unwrap WETH thất bại (tiền vẫn an toàn dạng WETH): {e}")
+            return swap_hash
+    except Exception as e:
+        print(f"[{chain.upper()}] ❌ {label}: {e}")
+        return None
+
+
+def execute_swap_evm_native(chain: str, from_token: str, to_token: str, amount_raw: str,
+                             label: str = "SWAP", token_age_min: Optional[float] = None) -> Optional[str]:
+    """Dispatcher cho 3 chain EVM-native (bnb/eth/robinhood) — chọn adapter V2/V3."""
+    style = EVM_CHAINS.get(chain, {}).get("router_style", "")
+    if style == "v2":
+        return _swap_uniswap_v2(chain, from_token, to_token, amount_raw, label, token_age_min)
+    if style == "v3":
+        return _swap_uniswap_v3(chain, from_token, to_token, amount_raw, label, token_age_min)
+    print(f"[{chain.upper()}] ❌ router_style không hợp lệ: {style}")
+    return None
+
+
+def _get_native_spent_evm(sig: str, chain: str) -> float:
+    """EVM-native buy: amount đã spend = tx.value (ta tự set khi build tx)."""
+    try:
+        w3 = _get_evm_w3(chain)
+        tx = w3.eth.get_transaction(sig)
+        return int(tx["value"]) / 1e18
+    except Exception as e:
+        print(f"[Confirm] ⚠️  _get_native_spent_evm({chain}): {e}")
+        return 0.0
+
+
+def _get_native_received_evm(sig: str, chain: str) -> float:
+    """EVM-native sell: native currency nhận về = delta balance ví quanh block của tx + gas fee đã trừ."""
+    try:
+        w3   = _get_evm_w3(chain)
+        rcpt = w3.eth.get_transaction_receipt(sig)
+        if not rcpt:
+            return 0.0
+        block_no = rcpt["blockNumber"]
+        wallet   = _get_evm_wallet_address()
+        if not wallet:
+            return 0.0
+        from web3 import Web3
+        wallet_cs  = Web3.to_checksum_address(wallet)
+        bal_before = w3.eth.get_balance(wallet_cs, block_identifier=block_no - 1)
+        bal_after  = w3.eth.get_balance(wallet_cs, block_identifier=block_no)
+        gas_used   = int(rcpt["gasUsed"])
+        eff_price  = int(rcpt.get("effectiveGasPrice", w3.eth.gas_price))
+        delta = (bal_after - bal_before) + (gas_used * eff_price)
+        return delta / 1e18 if delta > 0 else 0.0
+    except Exception as e:
+        print(f"[TP] ⚠️  _get_native_received_evm({chain}): {e}")
+        return 0.0
+
+
+# ================================================================
 # SWAP (chain-agnostic dispatcher)
 # ================================================================
 
@@ -2375,13 +2917,18 @@ def _usdc_raw(usdc: float, chain: str = "solana") -> str:
 def _buy_token_and_raw(chain: str) -> tuple:
     """
     Returns (from_token_address, raw_amount) for a buy swap.
-    Solana → buys with SOL (native WSOL mint), amount in lamports.
-    Base   → buys with USDC, amount in USDC raw units.
+    Solana                → buys with SOL (native WSOL mint), amount in lamports.
+    Base                  → buys with USDC, amount in USDC raw units.
+    BNB/ETH/Robinhood     → buys with native currency (BNB/ETH), amount in wei.
     Đọc BUY_AMOUNT từ cfg() để phản ánh thay đổi runtime.
     """
     if chain == "base":
         amount = cfg("BUY_AMOUNT_USDC") or BUY_AMOUNT_USDC
         return BASE_USDC, _usdc_raw(float(amount))
+    if chain in NATIVE_EVM_CHAINS:
+        env_key = EVM_CHAINS[chain]["buy_amount_env"]
+        amount = cfg(env_key) or float(os.getenv(env_key, "0.02"))
+        return EVM_NATIVE_SENTINEL, str(int(float(amount) * 10 ** 18))
     amount = cfg("BUY_AMOUNT_SOL") or BUY_AMOUNT_SOL
     return SOL_NATIVE, _sol_raw(float(amount))
 
@@ -2546,13 +3093,17 @@ def execute_swap(from_token: str, to_token: str, amount_raw: str,
                  token_age_min: Optional[float] = None) -> Optional[str]:
     """
     Chain-agnostic swap dispatcher.
-    - chain="solana" → Jupiter Lite API v1 (lite-api.jup.ag/swap/v1)
-                       Priority fee: priorityLevelWithMaxLamports (đúng format)
-                       Broadcast: Helius Sender hoặc RPC tùy HELIUS_USE_SENDER
-    - chain="base"   → OKX DEX API + web3.py EVM signing
+    - chain="solana"                    → Jupiter Lite API v1 (lite-api.jup.ag/swap/v1)
+                                          Priority fee: priorityLevelWithMaxLamports (đúng format)
+                                          Broadcast: Helius Sender hoặc RPC tùy HELIUS_USE_SENDER
+    - chain="base"                      → OKX DEX API + web3.py EVM signing
+    - chain in NATIVE_EVM_CHAINS         → PancakeSwap V2 (bsc) / Uniswap V2 (ethereum) /
+      (bsc/ethereum/robinhood)             Uniswap V3 (robinhood) qua web3.py trực tiếp
     """
     if chain == "base":
         return execute_swap_base(from_token, to_token, amount_raw, label, token_age_min)
+    if chain in NATIVE_EVM_CHAINS:
+        return execute_swap_evm_native(chain, from_token, to_token, amount_raw, label, token_age_min)
 
     # ================================================================
     # SOLANA — Jupiter Lite API v1
@@ -2673,6 +3224,8 @@ def get_token_raw_balance(mint: str, chain: str = "solana") -> str:
     """Lấy raw balance. Tự chọn RPC theo chain."""
     if chain == "base":
         return get_token_raw_balance_base(mint)
+    if chain in NATIVE_EVM_CHAINS:
+        return get_token_raw_balance_evm(chain, mint)
     # Solana path
     try:
         resp = requests.post(SOLANA_RPC_URL, json={
@@ -2713,9 +3266,16 @@ def check_goplus(addr: str, age_min: Optional[float] = None,
     raw_data chứa đầy đủ: holder info, mint/freeze authority, v.v.
     """
     try:
-        if chain == "base":
+        if chain == "base" or chain in NATIVE_EVM_CHAINS:
+            goplus_id = EVM_CHAINS.get(chain, {}).get("goplus_chain_id")
+            if not goplus_id:
+                # Chain chưa được GoPlus hỗ trợ (vd Robinhood Chain — quá mới) —
+                # bỏ qua honeypot check, KHÔNG chặn mua (giống hành vi fail-open
+                # hiện có khi GoPlus lỗi/không có data cho địa chỉ này).
+                print(f"[GoPlus] ⚠️  Chain {chain} chưa được GoPlus hỗ trợ — bỏ qua honeypot check")
+                return True, "", {}
             addr_q = addr.lower()
-            url = f"https://api.gopluslabs.io/api/v1/token_security/8453?contract_addresses={addr_q}"
+            url = f"https://api.gopluslabs.io/api/v1/token_security/{goplus_id}?contract_addresses={addr_q}"
         else:
             addr_q = addr
             url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={addr_q}"
@@ -2925,12 +3485,19 @@ PROFILE_SOURCES = [
 NEW_PAIRS_URLS = [
     "https://api.dexscreener.com/latest/dex/pairs/solana/new",
     "https://api.dexscreener.com/latest/dex/pairs/base/new",
+    "https://api.dexscreener.com/latest/dex/pairs/bsc/new",
+    "https://api.dexscreener.com/latest/dex/pairs/ethereum/new",
+    "https://api.dexscreener.com/latest/dex/pairs/robinhood/new",
 ]
 GECKO_NEW_POOL_URLS = [
     "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
     "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
     "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1",
     "https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=2",
+    "https://api.geckoterminal.com/api/v2/networks/bsc/new_pools?page=1",
+    "https://api.geckoterminal.com/api/v2/networks/eth/new_pools?page=1",
+    # Robinhood Chain: KHÔNG thêm — chưa xác nhận GeckoTerminal đã index
+    # chain này (mainnet quá mới). DexScreener /new ở trên đã cover chain này.
 ]
 
 REQUIRE_SOCIAL_WEB_X = str(os.getenv("REQUIRE_SOCIAL_WEB_X", "1")).strip().lower() in (
@@ -3140,18 +3707,23 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
     }
 
 def fetch_profile_addresses() -> List[str]:
-    """Nguồn A: Profile/Boost → địa chỉ token. TTL=30s, retry on 429."""
-    sol_addrs, base_addrs = [], []
-    sol_seen, base_seen   = set(), set()
+    """Nguồn A: Profile/Boost → địa chỉ token. TTL=30s, retry on 429.
+    Tổng quát cho mọi chain trong SUPPORTED_CHAINS (không đoán theo độ dài
+    chuỗi địa chỉ — dùng thẳng chainId DexScreener trả về)."""
+    addrs_by_chain: Dict[str, List[str]] = {c: [] for c in SUPPORTED_CHAINS}
+    seen_by_chain:  Dict[str, set]       = {c: set() for c in SUPPORTED_CHAINS}
+
+    def _add(cid: str, addr: str):
+        if cid in addrs_by_chain and addr not in seen_by_chain[cid]:
+            seen_by_chain[cid].add(addr)
+            addrs_by_chain[cid].append(addr)
+
     for url in PROFILE_SOURCES:
         # TTL dài hơn (30s) — Profile/Boost không thay đổi từng giây
         cached = _dex_cache.get(url, ttl=_CACHE_TTL_PROFILE)
         if cached is not None:
             for item in cached:
-                if item.get("chain") == "base" and item["addr"] not in base_seen:
-                    base_seen.add(item["addr"]); base_addrs.append(item["addr"])
-                elif item.get("chain") == "solana" and item["addr"] not in sol_seen:
-                    sol_seen.add(item["addr"]); sol_addrs.append(item["addr"])
+                _add(item.get("chain"), item["addr"])
             continue
         try:
             r = _dex_get_with_retry(url, label=url.split("/")[-1])
@@ -3165,14 +3737,17 @@ def fetch_profile_addresses() -> List[str]:
                 if not addr or cid not in SUPPORTED_CHAINS:
                     continue
                 batch.append({"addr": addr, "chain": cid})
-                if cid == "base" and addr not in base_seen:
-                    base_seen.add(addr); base_addrs.append(addr)
-                elif cid == "solana" and addr not in sol_seen:
-                    sol_seen.add(addr); sol_addrs.append(addr)
+                _add(cid, addr)
             _dex_cache.set(url, batch)
         except Exception as e:
             print(f"[Scan-A] ⚠️  {url.split('/')[-1]}: {e}")
-    return sol_addrs[:SOL_MAX_PROFILE_ADDRS] + base_addrs[:BASE_MAX_PROFILE_ADDRS]
+
+    caps = {"solana": SOL_MAX_PROFILE_ADDRS, "base": BASE_MAX_PROFILE_ADDRS}
+    result: List[str] = []
+    for c, addrs in addrs_by_chain.items():
+        cap = caps.get(c, EVM_NATIVE_MAX_PROFILE_ADDRS)
+        result.extend(addrs[:cap])
+    return result
 
 def fetch_token_pairs(addr: str) -> List[dict]:
     """Lấy pairs của 1 token address. Cache 8s, retry on 429."""
@@ -3379,6 +3954,9 @@ def _build_buy_links(token: dict) -> str:
     pair_addr = token.get("pair_address", addr)
     _up       = urllib.parse
 
+    if chain in NATIVE_EVM_CHAINS:
+        return _build_buy_links_evm_native(addr, pair_addr, chain)
+
     if chain == "solana":
         from_token = SOL_USDC
         chain_id   = "501"
@@ -3473,6 +4051,32 @@ def _build_buy_links(token: dict) -> str:
         )
 
 
+def _build_buy_links_evm_native(addr: str, pair_addr: str, chain: str) -> str:
+    """Deeplink mua thủ công cho BNB/ETH/Robinhood — chỉ dùng OKX Web3
+    (aggregator hỗ trợ đa chain) + DexScreener, tránh giả định sai DEX/chain
+    như từng xảy ra khi dùng chung nhánh Base."""
+    _up = urllib.parse
+    cfg_c      = EVM_CHAINS.get(chain, {})
+    chain_id   = str(cfg_c.get("chain_id", ""))
+    from_token = cfg_c.get("wrapped_native", "")
+    dex_slug   = cfg_c.get("dexscreener_slug", chain)
+
+    dex_url_okx = (
+        f"https://web3.okx.com/dex-swap"
+        f"#inputChain={chain_id}&inputCurrency={from_token}"
+        f"&outputChain={chain_id}&outputCurrency={addr}"
+    )
+    deep_okx = f"okx://wallet/dapp/url?dappUrl={_up.quote(dex_url_okx, safe='')}"
+    okx_link = f"https://web3.okx.com/download?deeplink={_up.quote(deep_okx, safe='')}"
+    dex_link = f"https://dexscreener.com/{dex_slug}/{pair_addr}"
+
+    return (
+        f"🛒 <b>Mua ngay:</b>\n"
+        f"  ├ <a href='{okx_link}'>🔶 OKX Web3 Wallet</a>\n"
+        f"  └ <a href='{dex_link}'>📊 DexScreener</a>"
+    )
+
+
 def send_early_alert(token: dict):
     """
     Cảnh báo sớm: token < EARLY_ALERT_MAX_AGE_MIN phút vừa xuất hiện.
@@ -3494,8 +4098,7 @@ def send_early_alert(token: dict):
     buys        = token.get("buys_24h", 0)
     sells       = token.get("sells_24h", 0)
     pair_addr   = token.get("pair_address", "")
-    chain_emoji = "🟣" if chain == "solana" else "🔵"
-    chain_name  = "SOLANA" if chain == "solana" else "BASE"
+    chain_emoji, chain_name = _chain_display(chain)
 
     # Định dạng tuổi
     if age is not None:
@@ -3512,8 +4115,7 @@ def send_early_alert(token: dict):
     else:
         press_icon, press_text = "⚠️", _t("Weak", "Yếu")
 
-    scan_url  = (f"https://basescan.org/token/{addr}" if chain == "base"
-                 else f"https://solscan.io/token/{addr}")
+    scan_url  = f"{_chain_explorer(chain, 'token')}{addr}"
     chart_url = f"https://dexscreener.com/{chain}/{pair_addr}"
     buy_links = _build_buy_links(token)
 
@@ -3587,7 +4189,7 @@ def _build_top_signal_message(rows: List[dict]) -> str:
     for i, r in enumerate(rows, start=1):
         sym = r.get("symbol", "?")
         chain = r.get("chain", "solana")
-        ch = "SOL" if chain == "solana" else "BASE"
+        ch = _chain_display(chain)[1]
         score = int(r.get("score", 0))
         liq = _fmt_usd(float(r.get("liq", 0) or 0))
         age = r.get("age", None)
@@ -3677,8 +4279,7 @@ def send_signal_alert(token: dict, score: int, detail: list):
     website    = token.get("website", "")
     twitter    = token.get("twitter", "")
 
-    chain_emoji = "🟣" if chain == "solana" else "🔵"
-    chain_name  = "SOLANA" if chain == "solana" else "BASE"
+    chain_emoji, chain_name = _chain_display(chain)
 
     # Strategy
     is_recovery  = (age is not None and age >= 60)
@@ -3752,8 +4353,7 @@ def send_signal_alert(token: dict, score: int, detail: list):
     if pc_h1 != 0:
         price_h1_str = f"  📈 {_t('Price h1','Price h1')}: <b>{pc_h1:+.1f}%</b>\n"
 
-    scan_url  = (f"https://basescan.org/token/{addr}" if chain == "base"
-                 else f"https://solscan.io/token/{addr}")
+    scan_url  = f"{_chain_explorer(chain, 'token')}{addr}"
     chart_url = f"https://dexscreener.com/{chain}/{pair_addr}"
     buy_links = _build_buy_links(token)
 
@@ -3821,10 +4421,16 @@ def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
                  "n/a": "—",
                  "unknown": f"❓ {_t('Unknown','Không rõ')}"}
     chain       = token.get("chain", "solana")
-    chain_emoji = "🟣" if chain == "solana" else "🔵"
-    chain_name  = "SOLANA" if chain == "solana" else "BASE"
-    spend_label = "SOL" if chain == "solana" else "USDC"
-    spend_amount = BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC
+    chain_emoji, chain_name = _chain_display(chain)
+    if chain == "solana":
+        spend_label, spend_amount = "SOL", BUY_AMOUNT_SOL
+    elif chain == "base":
+        spend_label, spend_amount = "USDC", BUY_AMOUNT_USDC
+    elif chain in NATIVE_EVM_CHAINS:
+        spend_label = chain_name
+        spend_amount = float(os.getenv(EVM_CHAINS[chain]["buy_amount_env"], "0.02"))
+    else:
+        spend_label, spend_amount = "?", 0.0
 
     est_price    = token.get("price_usd", 0)
     actual_price = token.get("actual_entry_price", 0)
@@ -3847,10 +4453,9 @@ def send_buy_signal(token: dict, score: int, detail: list, buy_sig: str):
         )
         tp_line = f"🎯 {_t('Take profit','Chốt lời')}: +{TAKE_PROFIT_PCT:.0f}% ({_t('from confirmed price','từ giá thực sau confirm')})"
 
-    explorer  = "https://basescan.org/tx/" if chain == "base" else "https://solscan.io/tx/"
+    explorer  = _chain_explorer(chain, "tx")
     chart_url = f"https://dexscreener.com/{chain}/{token['pair_address']}"
-    scan_url  = (f"https://basescan.org/token/{token['address']}" if chain == "base"
-                 else f"https://solscan.io/token/{token['address']}")
+    scan_url  = f"{_chain_explorer(chain, 'token')}{token['address']}"
     buy_links = _build_buy_links(token)
 
     msg = (
@@ -3915,13 +4520,14 @@ def _get_sol_received_solana(sig: str) -> float:
 def _get_usdc_received_from_sell_tx(sig: str, chain: str, label: str = "") -> float:
     """
     Returns amount received from sell TX.
-    Solana → SOL received. Base → USDC received.
+    Solana → SOL received. Base → USDC received. BNB/ETH/Robinhood → native received.
     """
     try:
         if chain == "base":
             return _get_usdc_received_base(sig)
-        else:
-            return _get_sol_received_solana(sig)
+        if chain in NATIVE_EVM_CHAINS:
+            return _get_native_received_evm(sig, chain)
+        return _get_sol_received_solana(sig)
     except Exception as e:
         print(f"[TP] ⚠️  {label} parse received: {e}")
         return 0.0
@@ -4019,9 +4625,17 @@ def send_tp_signal(pos: dict, cur_price: float, pct: float, sell_sig: str):
     """
     chain       = pos.get("chain", "solana")
     sym         = pos["symbol"]
-    spend_label = "SOL" if chain == "solana" else "USDC"
-    # usdc_spent trong DB luôn là native unit: SOL thô (Solana) hoặc USDC (Base)
-    native_spent = float(pos.get("usdc_spent", BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC))
+    if chain == "solana":
+        spend_label, default_spent = "SOL", BUY_AMOUNT_SOL
+    elif chain == "base":
+        spend_label, default_spent = "USDC", BUY_AMOUNT_USDC
+    elif chain in NATIVE_EVM_CHAINS:
+        spend_label = _chain_display(chain)[1]
+        default_spent = float(os.getenv(EVM_CHAINS[chain]["buy_amount_env"], "0.02"))
+    else:
+        spend_label, default_spent = "?", 0.0
+    # usdc_spent trong DB luôn là native unit: SOL/BNB/ETH thô (Solana/BNB/ETH/Robinhood) hoặc USDC (Base)
+    native_spent = float(pos.get("usdc_spent", default_spent))
     entry_price = float(pos.get("actual_entry_price") or pos.get("entry_price", 0))
     hold_time   = _duration_str(pos["entry_time"])
 
@@ -4070,9 +4684,8 @@ def send_tp_signal(pos: dict, cur_price: float, pct: float, sell_sig: str):
     elif net_pct >= 0:  emoji = "✅📈"
     else:               emoji = "📉❌"
 
-    chain_emoji = "🟣" if chain == "solana" else "🔵"
-    chain_name  = "SOLANA" if chain == "solana" else "BASE"
-    explorer    = "https://basescan.org/tx/" if chain == "base" else "https://solscan.io/tx/"
+    chain_emoji, chain_name = _chain_display(chain)
+    explorer    = _chain_explorer(chain, "tx")
     chart_url   = f"https://dexscreener.com/{chain}/{pos.get('pair_address','')}"
 
     msg = (
@@ -4155,11 +4768,11 @@ def scan_once() -> List[dict]:
             seen_addr.add(addr)
             all_addrs.append(addr)
 
-    sol_cnt   = sum(1 for a in all_addrs if len(a) > 42)
-    base_cnt  = len(all_addrs) - sol_cnt
+    sol_cnt = sum(1 for a in all_addrs if len(a) > 42)
+    evm_cnt = len(all_addrs) - sol_cnt   # gồm Base + BNB + ETH + Robinhood (đều địa chỉ 0x 42 ký tự)
     print(
         f"  [SCAN-A+C] {len(all_addrs)} địa chỉ (A:{len(_profile_addrs_result[0])} + C:{len(_gecko_addrs_result[0])}) "
-        f"(🟣 Sol:{sol_cnt} | 🔵 Base:{base_cnt}) — fetch song song"
+        f"(🟣 Sol:{sol_cnt} | ⛓️ EVM:{evm_cnt}) — fetch song song"
     )
 
     # Nguồn B fetch trong thread riêng đồng thời với Nguồn A
@@ -4980,9 +5593,18 @@ def _execute_buy(token: dict):
     chain     = token.get("chain", "solana")
     age_min   = token.get("token_age_minutes")
 
-    # Determine buy-from token and raw amount (SOL for Solana, USDC for Base)
+    # Determine buy-from token and raw amount
+    # (SOL cho Solana, USDC cho Base, native currency cho BNB/ETH/Robinhood)
     from_token, buy_raw = _buy_token_and_raw(chain)
-    buy_display = f"{BUY_AMOUNT_SOL} SOL" if chain == "solana" else f"{BUY_AMOUNT_USDC} USDC"
+    _, chain_disp_name = _chain_display(chain)
+    if chain == "solana":
+        buy_display = f"{BUY_AMOUNT_SOL} SOL"
+    elif chain == "base":
+        buy_display = f"{BUY_AMOUNT_USDC} USDC"
+    elif chain in NATIVE_EVM_CHAINS:
+        buy_display = f"{float(buy_raw) / 1e18:.5f} {chain_disp_name}"
+    else:
+        buy_display = buy_raw
 
     # ── Risk Manager check ──────────────────────────────────────────
     open_pos = len(db_get_positions())
@@ -5019,8 +5641,15 @@ def _execute_buy(token: dict):
         send_error_alert(f"❌ Mua {sym} [{chain}] thất bại\n<code>{addr}</code>")
         return
 
-    # Amount spent: SOL for Solana, USDC for Base
-    spent_amount = BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC
+    # Amount spent: SOL for Solana, USDC for Base, native currency for BNB/ETH/Robinhood
+    if chain == "solana":
+        spent_amount = BUY_AMOUNT_SOL
+    elif chain == "base":
+        spent_amount = BUY_AMOUNT_USDC
+    elif chain in NATIVE_EVM_CHAINS:
+        spent_amount = float(buy_raw) / 1e18
+    else:
+        spent_amount = 0.0
 
     # Ghi nhận lệnh mua vào RiskManager
     _risk_manager.record_trade()
@@ -5056,9 +5685,16 @@ def _execute_buy(token: dict):
                 return
 
             # ── Bước 2: đọc spend thực tế từ TX ─────────────────────
-            # Solana → SOL spent (lamport delta); Base → USDC spent
-            fallback_spend = BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC
-            spend_label    = "SOL" if chain == "solana" else "USDC"
+            # Solana → SOL spent (lamport delta); Base → USDC spent;
+            # BNB/ETH/Robinhood → native currency spent (tx.value)
+            if chain == "solana":
+                fallback_spend, spend_label = BUY_AMOUNT_SOL, "SOL"
+            elif chain == "base":
+                fallback_spend, spend_label = BUY_AMOUNT_USDC, "USDC"
+            elif chain in NATIVE_EVM_CHAINS:
+                fallback_spend, spend_label = float(buy_raw) / 1e18, chain_disp_name
+            else:
+                fallback_spend, spend_label = 0.0, "?"
             usdc_spent_actual = _get_spend_from_tx(sig, chain, sym)
             if usdc_spent_actual <= 0:
                 usdc_spent_actual = fallback_spend
@@ -5092,23 +5728,32 @@ def _execute_buy(token: dict):
             # Base: spend_amount = USDC thực chi → dùng trực tiếp
             #   → actual_price_usd = usdc_spent / delta_tokens
             #
+            # BNB/ETH/Robinhood: spend_amount = native currency thực chi
+            #   → cần × giá native/USD (qua WBNB/WETH trên DexScreener) để ra USD
+            #
             # Đảm bảo actual_entry_price cùng đơn vị với get_price_usd()
             # (USD/token) để monitor so sánh không bị lệch.
             est_price = token.get("price_usd", 0)
 
             if chain == "solana":
-                sol_usd = get_sol_price_usd()
-                if sol_usd > 0:
-                    usd_spent = usdc_spent_actual * sol_usd
-                    print(f"[Confirm] 💲 {sym}: {usdc_spent_actual:.6f} SOL × ${sol_usd:.2f} = ${usd_spent:.4f}")
+                native_usd = get_sol_price_usd()
+            elif chain in NATIVE_EVM_CHAINS:
+                native_usd = get_price_usd(EVM_CHAINS[chain]["wrapped_native"], chain=chain)
+            else:
+                native_usd = 0.0   # Base: USDC đã là USD, không cần quy đổi
+
+            if chain in ("solana",) or chain in NATIVE_EVM_CHAINS:
+                if native_usd > 0:
+                    usd_spent = usdc_spent_actual * native_usd
+                    print(f"[Confirm] 💲 {sym}: {usdc_spent_actual:.6f} {spend_label} × ${native_usd:.2f} = ${usd_spent:.4f}")
                 else:
-                    # Fallback: ngược lại từ giá DexScreener nếu không lấy được giá SOL
+                    # Fallback: ngược lại từ giá DexScreener nếu không lấy được giá native
                     if est_price > 0 and delta_tokens > 0:
                         usd_spent = est_price * delta_tokens
-                        print(f"[Confirm] ⚠️  {sym}: không lấy được giá SOL → ước USD từ DexScreener")
+                        print(f"[Confirm] ⚠️  {sym}: không lấy được giá {spend_label} → ước USD từ DexScreener")
                     else:
                         usd_spent = usdc_spent_actual   # worst-case giữ nguyên
-                        print(f"[Confirm] ⚠️  {sym}: fallback usd_spent = sol_spent (không chính xác)")
+                        print(f"[Confirm] ⚠️  {sym}: fallback usd_spent = {spend_label.lower()}_spent (không chính xác)")
             else:
                 usd_spent = usdc_spent_actual   # Base: đã là USDC
 
@@ -5120,7 +5765,7 @@ def _execute_buy(token: dict):
                 f"           Giá ước tính : ${est_price:.10f}\n"
                 f"           Giá thực tế  : ${actual_price:.10f}  (USD/token)\n"
                 f"           Slippage thực: {slippage_actual:+.2f}%\n"
-                f"           {'SOL' if chain == 'solana' else 'USDC'} tiêu : {usdc_spent_actual:.6f}\n"
+                f"           {spend_label} tiêu : {usdc_spent_actual:.6f}\n"
                 f"           USD quy đổi  : ${usd_spent:.4f}\n"
                 f"           Token nhận   : {delta_tokens:.6f}\n"
                 f"           TP target    : ${actual_price * (1 + TAKE_PROFIT_PCT/100):.10f}"
@@ -5230,8 +5875,7 @@ def _sell_position(pos: dict, reason: str = "TP") -> Optional[str]:
     mint  = pos["mint"]
     sym   = pos["symbol"]
     chain = pos.get("chain", "solana")
-    # Sell target: SOL for Solana, USDC for Base
-    to_token = BASE_USDC if chain == "base" else SOL_NATIVE
+    to_token = _sell_to_token(chain)
 
     raw = get_token_raw_balance(mint, chain=chain)
     if raw == "0":
@@ -5291,7 +5935,7 @@ def monitor_thread(stop_event: threading.Event):
                 fast_dump = _price_tracker.fast_dump_pct(mint, window_s=_fd_window)
                 if fast_dump <= _fd_pct:
                     if _is_hold_position(pos):
-                        chain_name = "SOLANA" if chain == "solana" else "BASE"
+                        chain_name = _chain_display(chain)[1]
                         hold_tag   = _t("HOLD mode — manual action required!",
                                         "Chế độ HOLD — cần xử lý thủ công!")
                         sent = _hold_alert_once(mint, "fast_dump",
@@ -5314,7 +5958,7 @@ def monitor_thread(stop_event: threading.Event):
                     entry_px = float(pos.get("actual_entry_price") or pos.get("entry_price", 0))
                     total_loss = (entry_px * float(pos.get("token_amount", 0)) *
                                   (fast_dump / 100)) if entry_px > 0 else 0
-                    chain_name = "SOLANA" if chain == "solana" else "BASE"
+                    chain_name = _chain_display(chain)[1]
                     _alert(
                         f"⚡🔴 <b>FAST DUMP [{chain_name}]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -5324,7 +5968,7 @@ def monitor_thread(stop_event: threading.Event):
                     )
                     sell_sig_fd = _sell_position(pos, reason="FAST_DUMP")
                     ok = bool(sell_sig_fd)
-                    native_spent = float(pos.get("usdc_spent", BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC))
+                    native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                     _risk_manager.record_close(-native_spent * abs(fast_dump) / 100)
                     _price_tracker.remove(mint)
                     if ok:
@@ -5349,7 +5993,7 @@ def monitor_thread(stop_event: threading.Event):
                         drop_pct = (cur / est_entry - 1) * 100
                         if drop_pct <= RUG_PRICE_DROP_1H:
                             if _is_hold_position(pos):
-                                chain_name = "SOLANA" if chain == "solana" else "BASE"
+                                chain_name = _chain_display(chain)[1]
                                 sent = _hold_alert_once(mint, "rug_preconfirm",
                                     f"🚨🟡 <b>RUG WARNING [{chain_name}]</b>\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -5379,7 +6023,7 @@ def monitor_thread(stop_event: threading.Event):
                             )
                             sell_sig_rug = _sell_position(pos, reason="RUG")
                             ok = bool(sell_sig_rug)
-                            native_spent = float(pos.get("usdc_spent", BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC))
+                            native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                             _risk_manager.record_close(-native_spent * abs(drop_pct) / 100)
                             _price_tracker.remove(mint)
                             if ok:
@@ -5413,9 +6057,8 @@ def monitor_thread(stop_event: threading.Event):
 
                 # ── RUG DETECTION: drop >= ngưỡng ─────────────────
                 if drop_pct <= RUG_PRICE_DROP_1H:
-                    chain_name = "SOLANA" if chain == "solana" else "BASE"
-                    scan_url   = (f"https://basescan.org/token/{mint}" if chain == "base"
-                                  else f"https://solscan.io/token/{mint}")
+                    chain_name = _chain_display(chain)[1]
+                    scan_url   = f"{_chain_explorer(chain, 'token')}{mint}"
 
                     if _is_hold_position(pos):
                         sent = _hold_alert_once(mint, "rug_confirmed",
@@ -5449,7 +6092,7 @@ def monitor_thread(stop_event: threading.Event):
                     )
                     sell_sig_rug = _sell_position(pos, reason="RUG")
                     ok = bool(sell_sig_rug)
-                    native_spent = float(pos.get("usdc_spent", BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC))
+                    native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                     _risk_manager.record_close(-native_spent * abs(drop_pct) / 100)
                     _price_tracker.remove(mint)
                     if ok:
@@ -5513,7 +6156,7 @@ def monitor_thread(stop_event: threading.Event):
                 if should_sell_tp:
                     # ── HOLD mode: alert but do not sell ──────────────
                     if _is_hold_position(pos):
-                        chain_name = "SOLANA" if chain == "solana" else "BASE"
+                        chain_name = _chain_display(chain)[1]
                         _hold_alert_once(mint, f"tp_{pct:.0f}",
                             f"{'🟣' if chain == 'solana' else '🔵'}🔒 "
                             f"<b>{_t('TP TARGET HIT','TP ĐẠT MỤC TIÊU')} [{chain_name}] — "
@@ -5532,7 +6175,7 @@ def monitor_thread(stop_event: threading.Event):
                         continue
 
                     print(f"  [Monitor] {tp_reason} → BÁN")
-                    to_token = BASE_USDC if chain == "base" else SOL_NATIVE
+                    to_token = _sell_to_token(chain)
                     raw  = get_token_raw_balance(mint, chain=chain)
                     if raw == "0":
                         db_close_position(mint)
@@ -5541,7 +6184,7 @@ def monitor_thread(stop_event: threading.Event):
                     sell_sig = execute_swap(mint, to_token, raw,
                                             label=f"SELL TP {sym}", chain=chain)
                     if sell_sig:
-                        native_spent = float(pos.get("usdc_spent", BUY_AMOUNT_SOL if chain == "solana" else BUY_AMOUNT_USDC))
+                        native_spent = float(pos.get("usdc_spent", _default_native_spent(chain)))
                         _risk_manager.record_close(native_spent * pct / 100)
                         _price_tracker.remove(mint)
                         # Log sell — native_received=0 tạm thời; send_tp_signal sẽ đọc TX thực
@@ -5605,22 +6248,45 @@ def main():
         print(f"⚠️  Base chain DISABLED (thiếu: {', '.join(base_missing)})")
         print("   Bot chỉ trade Solana. Thêm các key trên vào .env để bật Base.")
 
+    # ── BNB / ETH / Robinhood Chain: kiểm tra config, chỉ bật khi đủ ──
+    # Chain nào thiếu config sẽ KHÔNG được thêm vào SUPPORTED_CHAINS —
+    # scanner sẽ không nhận token của chain đó (an toàn hơn là chạy nửa vời).
+    native_evm_status = {}
+    for c in sorted(NATIVE_EVM_CHAINS):
+        ready, reason = _evm_chain_ready(c)
+        native_evm_status[c] = ready
+        if ready:
+            SUPPORTED_CHAINS.add(c)
+            print(f"✅ {_chain_display(c)[1]} chain ENABLED ({EVM_CHAINS[c]['router_style'].upper()} native swap)")
+        else:
+            print(f"⚠️  {_chain_display(c)[1]} chain DISABLED (thiếu: {reason})")
+    if native_evm_status.get("robinhood"):
+        print("   ⚠️  Robinhood Chain: nhớ đã tự xác minh router/quoter/WETH address "
+              "trên block explorer trước khi để bot trade tiền thật.")
+
     # Init DB
     init_db()
 
     solana_ok = bool(WALLET_ADDRESS and WALLET_PRIVKEY)
     base_ok   = bool(BASE_WALLET_PRIVKEY and OKX_API_KEY and OKX_SECRET_KEY)
-    chains_on = ("🟣 Solana" if solana_ok else "") + (" + 🔵 Base" if base_ok else "")
+    chains_on = (("🟣 Solana" if solana_ok else "") + (" + 🔵 Base" if base_ok else "")
+                 + "".join(f" + {_chain_display(c)[0]} {_chain_display(c)[1]}"
+                           for c in sorted(NATIVE_EVM_CHAINS) if native_evm_status.get(c)))
 
     print("=" * 65)
     print(f"🤖  MULTI-CHAIN TRADER v4.1  {chains_on}")
-    print(f"    Solana swap: Jupiter API v6  |  Base swap: OKX DEX")
+    print(f"    Solana swap: Jupiter API v6  |  Base swap: OKX DEX  |  "
+          f"BNB/ETH/Robinhood swap: native router (PancakeSwap V2 / Uniswap V2 / Uniswap V3)")
     print("=" * 65)
     print(f"  Wallet     : {WALLET_ADDRESS[:12]}...{WALLET_ADDRESS[-6:]}")
     print(f"  Jupiter    : {JUP_QUOTE_URL}")
     print(f"  Buy (SOL)  : {BUY_AMOUNT_SOL} SOL / trade  (Solana)")
     print(f"  Buy (Base) : {BUY_AMOUNT_USDC} USDC / trade (Base)")
-    print(f"  Sell to    : SOL (Solana) / USDC (Base)")
+    for c in sorted(NATIVE_EVM_CHAINS):
+        if native_evm_status.get(c):
+            amt = os.getenv(EVM_CHAINS[c]["buy_amount_env"], "0.02")
+            print(f"  Buy ({_chain_display(c)[1]:<9}): {amt} {_chain_display(c)[1]} / trade")
+    print(f"  Sell to    : SOL (Solana) / USDC (Base) / native currency (BNB/ETH/Robinhood)")
     # Sell mode display
     if SELL_MODE == "hold":
         sell_mode_str = "🔒 HOLD — never sell (manual only)"
@@ -5921,11 +6587,17 @@ def _content_positions() -> tuple:
         else:
             pct_str = "⏳ chờ"
 
-        chain_e = "🟣" if chain == "solana" else "🔵"
+        chain_e = _chain_display(chain)[0]
+        if chain == "solana":
+            spent_label = "SOL"
+        elif chain == "base":
+            spent_label = "USDC"
+        else:
+            spent_label = _chain_display(chain)[1]
         lines.append(
             f"\n{chain_e} <b>${sym}</b>  Score:{score}  |  {pct_str}  |  {hold_dur}\n"
             f"   Entry: <code>${entry_p:.8f}</code>  Nay: <code>${cur_price:.8f}</code>\n"
-            f"   Spent: {spent} {'SOL' if chain=='solana' else 'USDC'}\n"
+            f"   Spent: {spent} {spent_label}\n"
             f"   <code>{mint}</code>"
         )
         # Nút bán nhanh cho từng token
@@ -6221,7 +6893,7 @@ def _do_sell_mint(chat_id: str, mint: str, origin_msg_id: int = None):
            None)
 
     try:
-        to_token = BASE_USDC if chain == "base" else SOL_NATIVE
+        to_token = _sell_to_token(chain)
         raw      = get_token_raw_balance(mint, chain=chain)
 
         if raw == "0":
@@ -6240,8 +6912,7 @@ def _do_sell_mint(chat_id: str, mint: str, origin_msg_id: int = None):
             db_close_position(mint)
             _price_tracker.remove(mint)
             pct_str  = f"{'🟢' if pct >= 0 else '🔴'}{pct:+.1f}%"
-            explorer = (f"https://basescan.org/tx/{sell_sig}" if chain == "base"
-                        else f"https://solscan.io/tx/{sell_sig}")
+            explorer = f"{_chain_explorer(chain, 'tx')}{sell_sig}"
             _reply(chat_id,
                    f"✅ <b>Bán thành công!</b>\n"
                    f"🪙 Token: <b>${sym}</b>\n"
