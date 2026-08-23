@@ -196,6 +196,8 @@ vì không có vị thế tự động nào để theo dõi.
 - **Chốt lời quá sớm**: tăng `TP2_PCT` hoặc nới `TRAILING_STOP_PCT`.
 - **Rủi ro cao**: tăng `MIN_HOLDER_COUNT`, giảm `MAX_TOP10_HOLDER_PCT`, tăng `MIN_TOKEN_AGE_S`.
 - **Chain BNB/ETH/Robinhood không hoạt động**: xem log khởi động — bot in rõ `DISABLED (thiếu: ...)` cho từng chain. Điền đủ biến còn thiếu trong `.env` (mục 2b) rồi khởi động lại.
+- **Log thấy nhiều `[DexScreener] ⚠️ 429`, chu kỳ scan chậm bất thường**: bot đã tự giới hạn tốc độ gọi DexScreener (`DEX_MAX_REQUESTS_PER_SEC`, mặc định 4 req/s) để tránh bị rate-limit. Nếu vẫn còn 429 nhiều, giảm giá trị này xuống 2-3 trong `.env` (chu kỳ scan sẽ chậm hơn một chút, đổi lại ổn định hơn).
+- **Log thấy `[CMD] ⚠️  getUpdates HTTP 409`**: Telegram chỉ cho phép **1 tiến trình** long-poll cùng lúc trên 1 bot token. Lỗi này nghĩa là có ≥2 tiến trình bot đang chạy song song với cùng `TELEGRAM_BOT_TOKEN` (ví dụ: còn `python main.py`/`python bot.py` cũ chưa tắt hẳn, hoặc chạy `run.sh` 2 lần). Kiểm tra `ps aux | grep bot.py` và tắt hết tiến trình cũ trước khi chạy lại — không phải lỗi trong code.
 
 ## 8) Lệnh kiểm tra nhanh
 
