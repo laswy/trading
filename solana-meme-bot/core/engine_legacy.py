@@ -683,6 +683,7 @@ EVM_CHAINS: Dict[str, dict] = {
         "goplus_chain_id": "8453", "emoji": "🔵", "display_name": "BASE",
         "explorer_tx": "https://basescan.org/tx/",
         "explorer_token": "https://basescan.org/token/",
+        "valid_quotes": {"ETH", "WETH", "USDC", "USDT"},
     },
     # NOTE: key dict PHẢI khớp đúng giá trị `chainId` mà DexScreener trả về —
     # toàn bộ codebase lấy token["chain"] trực tiếp từ đó (xem _pair_to_token).
@@ -698,6 +699,7 @@ EVM_CHAINS: Dict[str, dict] = {
         "emoji": "🟡", "display_name": "BNB",
         "explorer_tx": "https://bscscan.com/tx/",
         "explorer_token": "https://bscscan.com/token/",
+        "valid_quotes": {"BNB", "WBNB", "BUSD", "USDT", "USDC"},
     },
     "ethereum": {
         "chain_id": 1, "dexscreener_slug": "ethereum",
@@ -709,6 +711,7 @@ EVM_CHAINS: Dict[str, dict] = {
         "emoji": "⚪", "display_name": "ETH",
         "explorer_tx": "https://etherscan.io/tx/",
         "explorer_token": "https://etherscan.io/token/",
+        "valid_quotes": {"ETH", "WETH", "USDC", "USDT", "DAI"},
     },
     "robinhood": {
         "chain_id": 4663, "dexscreener_slug": "robinhood",
@@ -722,6 +725,9 @@ EVM_CHAINS: Dict[str, dict] = {
         "emoji": "🟢", "display_name": "ROBINHOOD",
         "explorer_tx": "https://robinhoodchain.blockscout.com/tx/",
         "explorer_token": "https://robinhoodchain.blockscout.com/token/",
+        # Gas token là ETH (không có token gốc riêng); USDG = stablecoin infra
+        # chính thức của Robinhood Chain (Paxos).
+        "valid_quotes": {"ETH", "WETH", "USDG", "USDC"},
     },
 }
 NATIVE_EVM_CHAINS = {"bsc", "ethereum", "robinhood"}   # swap qua router riêng, KHÔNG qua OKX
@@ -3811,10 +3817,14 @@ def _pair_to_token(pair: dict) -> Optional[dict]:
     if chain_id not in SUPPORTED_CHAINS:
         return None
 
-    if chain_id == "base":
-        valid_quotes = BASE_VALID_QUOTES
-    else:
+    if chain_id == "solana":
         valid_quotes = SOLANA_VALID_QUOTES
+    else:
+        # base/bsc/ethereum/robinhood — mỗi chain quote khác nhau (ETH/WETH,
+        # BNB/WBNB, ...) — lấy đúng từ registry, KHÔNG mặc định SOLANA_VALID_QUOTES
+        # (bug cũ: mọi pair BNB/ETH/Robinhood đều bị loại vì quote không phải
+        # SOL/USDC, khiến các chain này không bao giờ có signal dù đã ENABLED).
+        valid_quotes = EVM_CHAINS.get(chain_id, {}).get("valid_quotes", BASE_VALID_QUOTES)
 
     quote = (pair.get("quoteToken") or {}).get("symbol", "")
     if quote not in valid_quotes:
